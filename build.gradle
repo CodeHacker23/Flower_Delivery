@@ -1,0 +1,97 @@
+plugins {
+    id 'java'
+    // Spring Boot 3.2.2 - стабильная версия, не 4.0.1 (такой версии не существует, блять!)
+    id 'org.springframework.boot' version '3.2.2'
+    // Обновленная версия dependency-management для совместимости с Gradle 9.x
+    // Версия 1.1.4 может конфликтовать с Gradle 9.2.1, поэтому обновляем
+    id 'io.spring.dependency-management' version '1.1.7'
+    // Flyway плагин НЕ НУЖЕН! Spring Boot сам управляет Flyway через зависимость flyway-core
+    // Если добавить плагин - будет конфликт и ошибки при синхронизации Gradle
+}
+
+group = 'org.example'
+version = '0.0.1-SNAPSHOT'
+description = 'Flower_Delivery'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+configurations {
+    compileOnly {
+        extendsFrom annotationProcessor
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // === ОСНОВНОЙ SPRING BOOT ===
+    // Стартер для веб-приложений (нужен для REST API, если понадобится админка через браузер)
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    
+    // Стартер для работы с БД через JPA (Java Persistence API)
+    // JPA - это как переводчик между Java объектами и таблицами в БД
+    // Ты пишешь Java класс, а JPA сам создает таблицу и переводит объекты в строки БД
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    
+    // === БАЗА ДАННЫХ ===
+    // PostgreSQL драйвер - это как USB-провод между Java и PostgreSQL
+    // Без него ты не сможешь подключиться к PostgreSQL (а мы решили использовать его, а не MySQL)
+    // PostgreSQL - более продвинутая БД, лучше для масштабирования (поэтому выбрали её!)
+    runtimeOnly 'org.postgresql:postgresql'
+    
+    // === JAXB (XML Binding) ===
+    // В Java 11+ модули JAXB удалены из JDK (были частью Java EE, теперь Jakarta EE)
+    // Hibernate использует JAXB для работы с JSON форматом в БД
+    // Без этой зависимости получишь ошибку: NoClassDefFoundError: javax/xml/bind/annotation/XmlElement
+    // Jackson module использует СТАРЫЙ javax.xml.bind, а не новый jakarta.xml.bind
+    // Поэтому добавляем старый javax.xml.bind API для совместимости
+    runtimeOnly 'javax.xml.bind:jaxb-api:2.3.1'
+    runtimeOnly 'org.glassfish.jaxb:jaxb-runtime:2.3.1'
+    
+    // === ANTLR (Parser для Hibernate) ===
+    // Hibernate использует ANTLR для парсинга HQL (Hibernate Query Language) запросов
+    // Без этой зависимости получишь ошибку: NoClassDefFoundError: org/antlr/v4/runtime/misc/ParseCancellationException
+    // ANTLR - это генератор парсеров, который Hibernate использует для разбора SQL/HQL
+    // Попробуем более старую стабильную версию 4.10.1 - она точно работает с Hibernate 6.x
+    implementation 'org.antlr:antlr4-runtime:4.10.1'
+    
+    // === КЭШИРОВАНИЕ (REDIS) ===
+    // Spring Data Redis - для работы с Redis (кэш для ускорения)
+    // Пока можем закомментировать, если Redis еще не установлен локально
+    // Раскомментируй когда Redis заработает
+    // implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+    
+    // === MIGRATIONS (МИГРАЦИИ БД) ===
+    // Flyway - это как Git для базы данных, только вместо кода версионирует структуру БД
+    // Что это значит? Смотри в файле ОБЪЯСНЕНИЯ_ДЛЯ_ЧАЙНИКОВ.md
+    // Flyway-core - Spring Boot сам запускает миграции при старте приложения!
+    // Раскомментировано - приложение запустилось, можно добавлять миграции!
+    implementation 'org.flywaydb:flyway-core'
+    
+    // === TELEGRAM BOT ===
+    // Библиотека для работы с Telegram Bot API
+    // Это как руль для управления твоим ботом
+    // Используем только стартер - он уже включает основную библиотеку telegrambots
+    // Не нужно добавлять обе зависимости - это может вызвать конфликт версий!
+    implementation 'org.telegram:telegrambots-spring-boot-starter:6.9.7.1'
+    
+    // === LOMBOK ===
+    // Lombok - магия, которая генерирует геттеры, сеттеры, конструкторы автоматически
+    // Вместо 50 строк кода пишешь @Getter @Setter - и всё, готово!
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+    
+    // === ТЕСТИРОВАНИЕ ===
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
