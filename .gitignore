@@ -35,3 +35,9 @@ out/
 
 ### VS Code ###
 .vscode/
+
+### Local config / secrets ###
+# Локальные конфиги и файлы с секретами не должны попадать в репозиторий
+src/main/resources/application-local.properties
+.env
+.env.*
