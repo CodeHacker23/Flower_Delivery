@@ -1,0 +1,269 @@
+package org.example.flower_delivery.handler;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.example.flower_delivery.Bot;
+import org.example.flower_delivery.model.Role;
+import org.example.flower_delivery.model.Shop;
+import org.example.flower_delivery.service.ShopService;
+import org.example.flower_delivery.service.UserService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.stereotype.Component;
+import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
+import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
+import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+
+/**
+ * Обработчик callback query - это когда пользователь нажимает на Inline кнопку
+ *
+ * <h2>Что это такое:</h2>
+ * Когда пользователь нажимает на кнопку (например "Магазин" или "Курьер"),
+ * Telegram отправляет нам CallbackQuery с данными кнопки (callback_data).
+ *
+ * <h2>Как это работает:</h2>
+ * <ol>
+ *   <li>Пользователь нажимает кнопку "🏪 Магазин"</li>
+ *   <li>Telegram отправляет CallbackQuery с callback_data="role_shop"</li>
+ *   <li>Мы обрабатываем это в handle()</li>
+ *   <li>Сохраняем роль в БД через UserService</li>
+ *   <li>Отправляем подтверждение пользователю</li>
+ * </ol>
+ *
+ * <h2>Примеры использования:</h2>
+ *
+ * <h3>1. Обработка выбора роли:</h3>
+ * <pre>{@code
+ * // Пользователь нажал "Магазин"
+ * CallbackQuery callbackQuery = update.getCallbackQuery();
+ * String callbackData = callbackQuery.getData(); // "role_shop"
+ *
+ * // Извлекаем роль из callback_data
+ * if (callbackData.equals("role_shop")) {
+ *     userService.updateUserRole(telegramId, Role.SHOP);
+ *     sendMessage(chatId, "Ты выбрал роль: Магазин");
+ * }
+ * }</pre>
+ *
+ * <h2>Важные моменты:</h2>
+ * <ul>
+ *   <li><b>AnswerCallbackQuery:</b> ОБЯЗАТЕЛЬНО нужно ответить на callback query,
+ *       иначе кнопка будет "висеть" (показывать загрузку)</li>
+ *   <li><b>callback_data:</b> Максимум 64 байта (короткие строки типа "role_shop")</li>
+ *   <li><b>getFrom():</b> Получаем информацию о пользователе, который нажал кнопку</li>
+ *   <li><b>getMessage():</b> Получаем сообщение, к которому прикреплена кнопка</li>
+ * </ul>
+ *
+ * <h2>Связь с другими компонентами:</h2>
+ * <ul>
+ *   <li>{@code StartCommandHandler} - создает кнопки с callback_data="role_shop"/"role_courier"</li>
+ *   <li>{@code UserService} - сохраняет выбранную роль в БД</li>
+ *   <li>{@code Bot} - вызывает handle() когда приходит CallbackQuery</li>
+ * </ul>
+ *
+ * @author Иларион
+ * @version 1.0
+ * @see org.example.flower_delivery.handler.StartCommandHandler
+ * @see org.example.flower_delivery.service.UserService
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class CallbackQueryHandler {
+
+    // Spring автоматически найдет UserService и подставит сюда (Dependency Injection)
+    private final UserService userService;
+
+    // Spring автоматически найдет Bot и подставит сюда (Dependency Injection)
+    // @Lazy - создаёт прокси для Bot, разрывая циклическую зависимость
+    @Autowired
+    @Lazy
+    private Bot bot;
+
+    // Обработчик регистрации магазина (для запуска после выбора роли "Магазин")
+    @Autowired
+    @Lazy
+    private ShopRegistrationHandler shopRegistrationHandler;
+
+    // Обработчик создания заказа
+    @Autowired
+    @Lazy
+    private OrderCreationHandler orderCreationHandler;
+
+    // Сервис магазинов (для показа информации о магазине)
+    private final ShopService shopService;
+
+    /**
+     * Обработать callback query (нажатие на кнопку)
+     *
+     * @param update - объект Update от Telegram с информацией о нажатии на кнопку
+     */
+    public void handle(Update update) {
+        // Проверяем, что в Update есть CallbackQuery
+        if (!update.hasCallbackQuery()) {
+            log.warn("Update не содержит CallbackQuery: {}", update);
+            return;
+        }
+
+        CallbackQuery callbackQuery = update.getCallbackQuery();
+        String callbackData = callbackQuery.getData();  // Данные кнопки (например "role_shop")
+        Long telegramId = callbackQuery.getFrom().getId();  // ID пользователя, который нажал
+        Long chatId = callbackQuery.getMessage().getChatId();  // ID чата
+
+        log.info("Обработка callback query: telegramId={}, callbackData={}", telegramId, callbackData);
+
+        try {
+            // Обрабатываем разные типы callback_data
+            if (callbackData.startsWith("role_")) {
+                // Сразу отвечаем на callback query, чтобы кнопка не "висела"
+                answerCallbackQuery(callbackQuery.getId(), "✅ Роль выбрана!");
+                handleRoleSelection(callbackData, telegramId, chatId);
+            } else if (callbackData.equals("create_order")) {
+                // Магазин хочет создать заказ
+                answerCallbackQuery(callbackQuery.getId(), "📦 Создаём заказ...");
+                orderCreationHandler.startOrderCreation(telegramId, chatId);
+            } else if (callbackData.equals("shop_info")) {
+                // Магазин хочет посмотреть информацию о себе
+                answerCallbackQuery(callbackQuery.getId(), "🏪 Информация о магазине");
+                handleShopInfo(telegramId, chatId);
+            } else if (callbackData.startsWith("delivery_date_")) {
+                // Выбор даты доставки при создании заказа
+                answerCallbackQuery(callbackQuery.getId(), "📅 Дата выбрана");
+                orderCreationHandler.handleDateSelection(telegramId, chatId, callbackData);
+            } else if (callbackData.startsWith("confirm_price_")) {
+                // Подтверждение автоматически рассчитанной цены
+                String priceStr = callbackData.replace("confirm_price_", "");
+                answerCallbackQuery(callbackQuery.getId(), "✅ Цена подтверждена");
+                orderCreationHandler.handlePriceConfirmation(telegramId, chatId, new java.math.BigDecimal(priceStr));
+            } else {
+                log.warn("Неизвестный callback_data: {}", callbackData);
+                answerCallbackQuery(callbackQuery.getId(), "❌ Неизвестная команда");
+            }
+
+        } catch (Exception e) {
+            log.error("Ошибка при обработке callback query: telegramId={}, callbackData={}",
+                    telegramId, callbackData, e);
+            answerCallbackQuery(callbackQuery.getId(), "❌ Произошла ошибка. Попробуй позже.");
+        }
+    }
+
+    /**
+     * Обработать выбор роли (Магазин или Курьер)
+     *
+     * @param callbackData - данные кнопки ("role_shop" или "role_courier")
+     * @param telegramId - Telegram ID пользователя
+     * @param chatId - ID чата (куда отправить ответ)
+     */
+    private void handleRoleSelection(String callbackData, Long telegramId, Long chatId) {
+        Role selectedRole;
+
+        // Определяем роль из callback_data
+        if (callbackData.equals("role_shop")) {
+            selectedRole = Role.SHOP;
+        } else if (callbackData.equals("role_courier")) {
+            selectedRole = Role.COURIER;
+        } else {
+            log.warn("Неизвестная роль в callback_data: {}", callbackData);
+            sendMessage(chatId, "❌ Неизвестная роль. Попробуй еще раз.");
+            return;
+        }
+
+        try {
+            // Обновляем роль пользователя в БД
+            userService.updateUserRole(telegramId, selectedRole);
+            log.info("Роль успешно обновлена: telegramId={}, role={}", telegramId, selectedRole);
+
+            // Разная логика для разных ролей
+            if (selectedRole == Role.SHOP) {
+                // Для магазина — сразу запускаем регистрацию
+                sendMessage(chatId, "✅ Отлично! Ты выбрал роль: *Магазин*\n\n" +
+                        "Теперь давай заполним информацию о твоём магазине.");
+                shopRegistrationHandler.startRegistrationFromCallback(telegramId, chatId);
+            } else if (selectedRole == Role.COURIER) {
+                // Для курьера — пока просто сообщение (логику добавим позже)
+                sendMessage(chatId, "✅ Отлично! Ты выбрал роль: *Курьер*\n\n" +
+                        "Твоя роль сохранена в системе.\n" +
+                        "Скоро администратор активирует твой аккаунт.\n\n" +
+                        "Ожидай активации! ⏳");
+            }
+
+        } catch (IllegalArgumentException e) {
+            // Пользователь не найден (не должен случиться, но на всякий случай)
+            log.error("Пользователь не найден при обновлении роли: telegramId={}", telegramId);
+            sendMessage(chatId, "❌ Ошибка: пользователь не найден. Попробуй /start");
+        } catch (Exception e) {
+            log.error("Ошибка при обновлении роли: telegramId={}, role={}", telegramId, selectedRole, e);
+            sendMessage(chatId, "❌ Произошла ошибка при сохранении роли. Попробуй позже.");
+        }
+    }
+
+    /**
+     * Показать информацию о магазине (личный кабинет).
+     */
+    private void handleShopInfo(Long telegramId, Long chatId) {
+        var shopOptional = shopService.findByUserTelegramId(telegramId);
+        
+        if (shopOptional.isEmpty()) {
+            sendMessage(chatId, "❌ У тебя нет зарегистрированного магазина.");
+            return;
+        }
+        
+        Shop shop = shopOptional.get();
+        
+        String status = shop.getIsActive() ? "✅ Активен" : "⏳ Ожидает активации";
+        
+        sendMessage(chatId, "🏪 *Мой магазин*\n\n" +
+                "📋 *Информация:*\n" +
+                "• Название: " + shop.getShopName() + "\n" +
+                "• Адрес забора: " + shop.getPickupAddress() + "\n" +
+                "• Телефон: " + shop.getPhone() + "\n" +
+                "• Статус: " + status + "\n\n" +
+                "📅 Зарегистрирован: " + shop.getCreatedAt().toLocalDate());
+    }
+
+    /**
+     * Отправить сообщение пользователю
+     *
+     * @param chatId - ID чата (куда отправить)
+     * @param text - текст сообщения
+     */
+    private void sendMessage(Long chatId, String text) {
+        try {
+            SendMessage message = SendMessage.builder()
+                    .chatId(chatId.toString())
+                    .text(text)
+                    .parseMode("Markdown")  // Поддержка Markdown (жирный текст, курсив и т.д.)
+                    .build();
+
+            bot.execute(message);
+            log.debug("Сообщение отправлено: chatId={}", chatId);
+
+        } catch (TelegramApiException e) {
+            log.error("Ошибка при отправке сообщения: chatId={}", chatId, e);
+        }
+    }
+
+    /**
+     * Ответить на callback query (ОБЯЗАТЕЛЬНО! иначе кнопка будет "висеть")
+     *
+     * @param callbackQueryId - ID callback query (нужен для ответа)
+     * @param text - текст уведомления (показывается пользователю как всплывающее сообщение)
+     */
+    private void answerCallbackQuery(String callbackQueryId, String text) {
+        try {
+            AnswerCallbackQuery answer = AnswerCallbackQuery.builder()
+                    .callbackQueryId(callbackQueryId)
+                    .text(text)
+                    .showAlert(false)  // false = маленькое уведомление, true = всплывающее окно
+                    .build();
+
+            bot.execute(answer);
+            log.debug("Callback query ответ отправлен: callbackQueryId={}", callbackQueryId);
+
+        } catch (TelegramApiException e) {
+            log.error("Ошибка при отправке ответа на callback query: callbackQueryId={}", callbackQueryId, e);
+        }
+    }
+}

@@ -15,94 +15,9 @@ import java.util.UUID;
  * Этот класс связывает Java код с таблицей users в БД через JPA/Hibernate.
  * Вместо того чтобы писать SQL вручную, ты работаешь с Java объектами,
  * а Hibernate автоматически переводит это в SQL запросы.
- * 
- * <h2>Как это работает:</h2>
- * <ul>
- *   <li><b>В БД:</b> таблица users с колонками (id, telegram_id, full_name, ...)</li>
- *   <li><b>В Java:</b> класс User с полями (id, telegramId, fullName, ...)</li>
- *   <li><b>Hibernate:</b> автоматически маппит Java объекты ↔ SQL запросы</li>
- * </ul>
- * 
- * <h2>Примеры использования:</h2>
- * 
- * <h3>1. Создание пользователя через Builder:</h3>
- * <pre>{@code
- * User user = User.builder()
- *     .telegramId(123456789L)
- *     .fullName("Иван Иванов")
- *     .phone("+79991234567")
- *     .role(Role.COURIER)
- *     .isActive(false)
- *     .build();
- * 
- * // id, createdAt, updatedAt - автоматически заполнятся Hibernate
- * userRepository.save(user);
- * }</pre>
- * 
- * <h3>2. Получение пользователя из БД:</h3>
- * <pre>{@code
- * Optional<User> userOpt = userRepository.findByTelegramId(123456789L);
- * if (userOpt.isPresent()) {
- *     User user = userOpt.get();
- *     System.out.println(user.getFullName()); // "Иван Иванов"
- *     System.out.println(user.getRole());     // COURIER
- * }
- * }</pre>
- * 
- * <h3>3. Обновление пользователя:</h3>
- * <pre>{@code
- * User user = userRepository.findByTelegramId(123456789L).orElseThrow();
- * user.setFullName("Петр Петров");
- * user.setPhone("+79997654321");
- * // updatedAt автоматически обновится через @UpdateTimestamp
- * userRepository.save(user);
- * }</pre>
- * 
- * <h2>Важные моменты:</h2>
- * <ul>
- *   <li><b>id:</b> UUID, генерируется автоматически PostgreSQL при создании записи</li>
- *   <li><b>telegramId:</b> уникальный, обязательный (не может быть NULL)</li>
- *   <li><b>role:</b> может быть NULL при регистрации, админ назначит позже</li>
- *   <li><b>isActive:</b> по умолчанию false, админ активирует</li>
- *   <li><b>createdAt:</b> автоматически заполняется при создании, нельзя изменить</li>
- *   <li><b>updatedAt:</b> автоматически обновляется при каждом изменении</li>
- * </ul>
- * 
- * <h2>Связь с БД:</h2>
- * Этот класс маппится на таблицу users, созданную миграцией V1:
- * {@code src/main/resources/db/migration/V1__create_users_table.sql}
- * 
- * <h2>Аннотации JPA:</h2>
- * <ul>
- *   <li>{@code @Entity} - говорит Hibernate: "Это таблица в БД!"</li>
- *   <li>{@code @Table(name = "users")} - название таблицы (должно совпадать с миграцией!)</li>
- *   <li>{@code @Id} - первичный ключ (PRIMARY KEY)</li>
- *   <li>{@code @Column} - маппинг Java поля на колонку БД</li>
- *   <li>{@code @Enumerated(EnumType.STRING)} - enum сохраняется как строка в БД</li>
- * </ul>
- * 
- * <h2>Lombok аннотации:</h2>
- * <ul>
- *   <li>{@code @Getter} - автоматически создает getter методы (getId(), getTelegramId(), ...)</li>
- *   <li>{@code @Setter} - автоматически создает setter методы (setId(), setTelegramId(), ...)</li>
- *   <li>{@code @NoArgsConstructor} - конструктор без параметров (нужен для Hibernate)</li>
- *   <li>{@code @AllArgsConstructor} - конструктор со всеми параметрами</li>
- *   <li>{@code @Builder} - паттерн Builder для удобного создания объектов</li>
- * </ul>
- * 
- * <h2>Где используется:</h2>
- * <ul>
- *   <li>{@code UserRepository} - для работы с БД (поиск, сохранение, удаление)</li>
- *   <li>{@code UserService} - бизнес-логика (регистрация, проверка ролей)</li>
- *   <li>Обработчики бота - для работы с пользователями</li>
- * </ul>
- * 
- * @author Иларион
- * @version 1.0
- * @see org.example.flower_delivery.model.Role
- * @see org.example.flower_delivery.repository.UserRepository
- * @see org.example.flower_delivery.service.UserService
- */
+ *
+ **/
+
 @Entity
 @Table(name = "users") // название таблицы в БД (должно совпадать с миграцией! регистр в регистр!)
 @Getter  // Lombok: автоматически создаст getter методы (getId(), getTelegramId(), ...)
@@ -193,5 +108,10 @@ public class User {
     @Column(name = "updated_at", nullable = false)
     private LocalDateTime updatedAt;
 }
+
+
+
+
+
 
 

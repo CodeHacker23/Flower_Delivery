@@ -1,10 +1,25 @@
 package org.example.flower_delivery;
 
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.example.flower_delivery.handler.CallbackQueryHandler;
+import org.example.flower_delivery.handler.OrderCreationHandler;
+import org.example.flower_delivery.handler.ShopRegistrationHandler;
+import org.example.flower_delivery.handler.StartCommandHandler;
+import org.example.flower_delivery.model.Order;
+import org.example.flower_delivery.model.Shop;
+import org.example.flower_delivery.service.OrderService;
+import org.example.flower_delivery.service.ShopService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
+import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMarkup;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardRow;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+
+import java.util.List;
 
 /**
  * Главный класс бота - это как "мозг" который слушает сообщения от Telegram
@@ -17,6 +32,7 @@ import org.telegram.telegrambots.meta.api.objects.Update;
  * Есть еще WebhookBot (более продвинутый, но сложнее настраивать)
  * Для начала LongPolling - проще и надежнее
  */
+@Slf4j
 @Component
 @RequiredArgsConstructor
 public class Bot extends TelegramLongPollingBot {
@@ -30,6 +46,24 @@ public class Bot extends TelegramLongPollingBot {
     @Value("${telegram.bot.username}")
     private String botUsername;
     
+    // Инжектируем обработчик команды /start (Spring автоматически подставит!)
+    private final StartCommandHandler startCommandHandler;
+    
+    // Инжектируем обработчик нажатий на кнопки (Spring автоматически подставит!)
+    private final CallbackQueryHandler callbackQueryHandler;
+    
+    // Инжектируем обработчик регистрации магазина
+    private final ShopRegistrationHandler shopRegistrationHandler;
+    
+    // Инжектируем обработчик создания заказа
+    private final OrderCreationHandler orderCreationHandler;
+    
+    // Инжектируем сервис магазинов (для временной команды /activate)
+    private final ShopService shopService;
+    
+    // Инжектируем сервис заказов (для просмотра заказов)
+    private final OrderService orderService;
+    
     /**
      * Метод который вызывается КАЖДЫЙ РАЗ когда приходит новое сообщение/команда/кнопка
      * 
@@ -39,12 +73,222 @@ public class Bot extends TelegramLongPollingBot {
      * - Нажатие на кнопку (callback)
      * - Геолокация, фото, документ - всё что угодно!
      * 
-     * Сейчас метод пустой - тут будет логика обработки (пока не реализована)
+     * Сейчас метод:
+     * 1. Проверяет команду /start и делегирует обработку StartCommandHandler
+     * 2. Проверяет нажатие на кнопку (callback query) и делегирует CallbackQueryHandler
      */
     @Override
     public void onUpdateReceived(Update update) {
-        // TODO: Здесь будет обработка сообщений
-        // Пока ничего не делаем, просто принимаем обновления
+        // Проверяем, есть ли нажатие на кнопку (callback query)
+        if (update.hasCallbackQuery()) {
+            callbackQueryHandler.handle(update);
+            return;
+        }
+        
+        // Проверяем, есть ли сообщение с контактом (кнопка "Поделиться номером")
+        if (update.hasMessage() && update.getMessage().hasContact()) {
+            if (shopRegistrationHandler.handleContact(update)) {
+                return; // Контакт обработан
+            }
+        }
+        
+        // Проверяем, есть ли сообщение с текстом
+        if (update.hasMessage() && update.getMessage().hasText()) {
+            String text = update.getMessage().getText();
+            
+            // Если юзер в процессе регистрации магазина — обрабатываем его сообщение
+            if (shopRegistrationHandler.handleMessage(update)) {
+                return; // Сообщение обработано хендлером регистрации
+            }
+            
+            // Если юзер в процессе создания заказа — обрабатываем его сообщение
+            if (orderCreationHandler.handleMessage(update)) {
+                return; // Сообщение обработано хендлером создания заказа
+            }
+            
+            // Обработка команд
+            if (text.equals("/start")) {
+                startCommandHandler.handle(update);
+            }
+            // ВРЕМЕННАЯ КОМАНДА: активировать свой магазин (для тестирования)
+            else if (text.equals("/r")) {
+                handleActivateCommand(update);
+            }
+            // Кнопка меню: Создать заказ
+            else if (text.equals("📦 Создать заказ")) {
+                Long telegramId = update.getMessage().getFrom().getId();
+                Long chatId = update.getMessage().getChatId();
+                orderCreationHandler.startOrderCreation(telegramId, chatId);
+            }
+            // Кнопка меню: Мой магазин
+            else if (text.equals("🏪 Мой магазин")) {
+                handleShopInfoButton(update);
+            }
+            // Кнопка меню: Мои заказы
+            else if (text.equals("📋 Мои заказы")) {
+                handleMyOrdersButton(update);
+            }
+            // Здесь позже добавим обработку других команд (/help, /orders и т.д.)
+        }
+    }
+    
+    /**
+     * Обработка кнопки "Мои заказы" — показать список заказов магазина.
+     */
+    private void handleMyOrdersButton(Update update) {
+        Long telegramId = update.getMessage().getFrom().getId();
+        Long chatId = update.getMessage().getChatId();
+        
+        // Находим магазин пользователя
+        var shopOptional = shopService.findByUserTelegramId(telegramId);
+        
+        if (shopOptional.isEmpty()) {
+            sendSimpleMessage(chatId, "❌ У тебя нет зарегистрированного магазина.");
+            return;
+        }
+        
+        Shop shop = shopOptional.get();
+        
+        // Получаем заказы магазина
+        List<Order> orders = orderService.getOrdersByShop(shop);
+        
+        if (orders.isEmpty()) {
+            sendSimpleMessage(chatId, "📋 *Мои заказы*\n\n" +
+                    "У тебя пока нет заказов.\n" +
+                    "Нажми \"📦 Создать заказ\" чтобы создать первый!");
+            return;
+        }
+        
+        // Формируем список заказов
+        StringBuilder sb = new StringBuilder();
+        sb.append("📋 *Мои заказы* (").append(orders.size()).append(")\n\n");
+        
+        for (int i = 0; i < orders.size(); i++) {
+            Order order = orders.get(i);
+            sb.append("*").append(i + 1).append(". ").append(order.getRecipientName()).append("*\n");
+            sb.append("   📍 ").append(order.getDeliveryAddress()).append("\n");
+            sb.append("   💰 ").append(order.getDeliveryPrice()).append("₽\n");
+            sb.append("   📊 Статус: ").append(order.getStatus().getDisplayName()).append("\n");
+            
+            // Если есть курьер — показываем его телефон
+            if (order.getCourier() != null) {
+                sb.append("   🚴 Курьер: ").append(order.getCourier().getPhone()).append("\n");
+            }
+            
+            sb.append("\n");
+        }
+        
+        sendSimpleMessage(chatId, sb.toString());
+    }
+    
+    /**
+     * Обработка кнопки "Мой магазин" (информация о магазине).
+     */
+    private void handleShopInfoButton(Update update) {
+        Long telegramId = update.getMessage().getFrom().getId();
+        Long chatId = update.getMessage().getChatId();
+        
+        var shopOptional = shopService.findByUserTelegramId(telegramId);
+        
+        if (shopOptional.isEmpty()) {
+            sendSimpleMessage(chatId, "❌ У тебя нет зарегистрированного магазина.");
+            return;
+        }
+        
+        Shop shop = shopOptional.get();
+        String status = shop.getIsActive() ? "✅ Активен" : "⏳ Ожидает активации";
+        
+        sendSimpleMessage(chatId, "🏪 *Мой магазин*\n\n" +
+                "📋 *Информация:*\n" +
+                "• Название: " + shop.getShopName() + "\n" +
+                "• Адрес забора: " + shop.getPickupAddress() + "\n" +
+                "• Телефон: " + shop.getPhone() + "\n" +
+                "• Статус: " + status + "\n\n" +
+                "📅 Зарегистрирован: " + shop.getCreatedAt().toLocalDate());
+    }
+    
+    /**
+     * ВРЕМЕННАЯ КОМАНДА для тестирования.
+     * Активирует магазин текущего пользователя.
+     * 
+     * В продакшене это должен делать админ через админку!
+     */
+    private void handleActivateCommand(Update update) {
+        Long telegramId = update.getMessage().getFrom().getId();
+        Long chatId = update.getMessage().getChatId();
+        
+        var shopOptional = shopService.findByUserTelegramId(telegramId);
+        
+        if (shopOptional.isEmpty()) {
+            sendSimpleMessage(chatId, "❌ У тебя нет магазина для активации.");
+            return;
+        }
+        
+        Shop shop = shopOptional.get();
+        
+        if (shop.getIsActive()) {
+            // Магазин уже активен — показываем меню
+            sendShopMenu(chatId, shop, "✅ Твой магазин уже активен!");
+            return;
+        }
+        
+        // Активируем магазин
+        shop.setIsActive(true);
+        shopService.save(shop);
+        
+        log.info("Магазин активирован (тестовая команда): shopId={}, telegramId={}", 
+                shop.getId(), telegramId);
+        
+        // Показываем меню магазина
+        sendShopMenu(chatId, shop, "✅ *Магазин активирован!*\n\n" +
+                "Теперь ты можешь создавать заказы.");
+    }
+    
+    /**
+     * Показать меню магазина с кнопками (ReplyKeyboard — внизу экрана).
+     */
+    private void sendShopMenu(Long chatId, Shop shop, String headerText) {
+        // Создаём ряды с кнопками
+        KeyboardRow row1 = new KeyboardRow();
+        row1.add("📦 Создать заказ");
+        row1.add("📋 Мои заказы");
+        
+        KeyboardRow row2 = new KeyboardRow();
+        row2.add("🏪 Мой магазин");
+        
+        // Собираем клавиатуру (2 ряда)
+        ReplyKeyboardMarkup keyboard = new ReplyKeyboardMarkup();
+        keyboard.setKeyboard(List.of(row1, row2));
+        keyboard.setResizeKeyboard(true);  // Подогнать размер под текст
+        keyboard.setOneTimeKeyboard(false); // НЕ скрывать после нажатия — всегда видна!
+        
+        try {
+            SendMessage message = SendMessage.builder()
+                    .chatId(chatId.toString())
+                    .text(headerText)
+                    .parseMode("Markdown")
+                    .replyMarkup(keyboard)
+                    .build();
+            execute(message);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки меню магазина: chatId={}", chatId, e);
+        }
+    }
+    
+    /**
+     * Простая отправка сообщения (для временных команд).
+     */
+    private void sendSimpleMessage(Long chatId, String text) {
+        try {
+            SendMessage message = SendMessage.builder()
+                    .chatId(chatId.toString())
+                    .text(text)
+                    .parseMode("Markdown")
+                    .build();
+            execute(message);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки сообщения: chatId={}", chatId, e);
+        }
     }
 
     /**
