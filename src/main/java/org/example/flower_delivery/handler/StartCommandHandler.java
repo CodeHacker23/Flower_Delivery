@@ -97,7 +97,7 @@ public class StartCommandHandler {
             sendErrorMessage(chatId);
         }
     }
-
+    // что то хз
     /**
      * Отправить приветственное сообщение с кнопками выбора роли
      *
