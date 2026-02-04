@@ -3,6 +3,7 @@ package org.example.flower_delivery;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.example.flower_delivery.handler.CallbackQueryHandler;
+import org.example.flower_delivery.handler.MyOrdersSelectionHandler;
 import org.example.flower_delivery.handler.OrderCreationHandler;
 import org.example.flower_delivery.handler.ShopRegistrationHandler;
 import org.example.flower_delivery.handler.StartCommandHandler;
@@ -15,10 +16,13 @@ import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMarkup;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardRow;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -57,6 +61,12 @@ public class Bot extends TelegramLongPollingBot {
     
     // Инжектируем обработчик создания заказа
     private final OrderCreationHandler orderCreationHandler;
+
+    // Обработчик выбора заказа из списка \"Мои заказы\"
+    private final MyOrdersSelectionHandler myOrdersSelectionHandler;
+
+    // Обработчик редактирования заказа (меню + ввод нового значения)
+    private final org.example.flower_delivery.handler.OrderEditHandler orderEditHandler;
     
     // Инжектируем сервис магазинов (для временной команды /activate)
     private final ShopService shopService;
@@ -95,6 +105,8 @@ public class Bot extends TelegramLongPollingBot {
         // Проверяем, есть ли сообщение с текстом
         if (update.hasMessage() && update.getMessage().hasText()) {
             String text = update.getMessage().getText();
+            Long telegramId = update.getMessage().getFrom().getId();
+            Long chatId = update.getMessage().getChatId();
             
             // Если юзер в процессе регистрации магазина — обрабатываем его сообщение
             if (shopRegistrationHandler.handleMessage(update)) {
@@ -104,6 +116,20 @@ public class Bot extends TelegramLongPollingBot {
             // Если юзер в процессе создания заказа — обрабатываем его сообщение
             if (orderCreationHandler.handleMessage(update)) {
                 return; // Сообщение обработано хендлером создания заказа
+            }
+
+            // Если юзер выбирает заказ из списка \"Мои заказы\"
+            if (myOrdersSelectionHandler.isAwaitingSelection(telegramId)) {
+                if (myOrdersSelectionHandler.handleText(telegramId, chatId, text)) {
+                    return;
+                }
+            }
+
+            // Если юзер в процессе редактирования заказа (ждёт ввод нового адреса/телефона/комментария)
+            if (orderEditHandler.isEditing(telegramId)) {
+                if (orderEditHandler.handleText(telegramId, chatId, text)) {
+                    return;
+                }
             }
             
             // Обработка команд
@@ -116,8 +142,6 @@ public class Bot extends TelegramLongPollingBot {
             }
             // Кнопка меню: Создать заказ
             else if (text.equals("📦 Создать заказ")) {
-                Long telegramId = update.getMessage().getFrom().getId();
-                Long chatId = update.getMessage().getChatId();
                 orderCreationHandler.startOrderCreation(telegramId, chatId);
             }
             // Кнопка меню: Мой магазин
@@ -150,23 +174,52 @@ public class Bot extends TelegramLongPollingBot {
         Shop shop = shopOptional.get();
         
         // Получаем заказы магазина
-        List<Order> orders = orderService.getOrdersByShop(shop);
+        List<Order> allOrders = orderService.getOrdersByShop(shop);
         
-        if (orders.isEmpty()) {
+        if (allOrders.isEmpty()) {
             sendSimpleMessage(chatId, "📋 *Мои заказы*\n\n" +
                     "У тебя пока нет заказов.\n" +
                     "Нажми \"📦 Создать заказ\" чтобы создать первый!");
             return;
         }
+
+        // Ограничиваем список последними 20 заказами (если заказов больше)
+        int max = 20;
+        int fromIndex = Math.max(0, allOrders.size() - max);
+        List<Order> orders = allOrders.subList(fromIndex, allOrders.size());
         
         // Формируем список заказов
         StringBuilder sb = new StringBuilder();
-        sb.append("📋 *Мои заказы* (").append(orders.size()).append(")\n\n");
+        sb.append("📋 *Мои заказы* (").append(allOrders.size()).append(" всего, показаны последние ")
+                .append(orders.size()).append(")\n\n");
         
         for (int i = 0; i < orders.size(); i++) {
             Order order = orders.get(i);
-            sb.append("*").append(i + 1).append(". ").append(order.getRecipientName()).append("*\n");
-            sb.append("   📍 ").append(order.getDeliveryAddress()).append("\n");
+            
+            // Проверяем, мультиадресный ли заказ
+            if (order.isMultiStopOrder()) {
+                // Мультиадресный заказ
+                sb.append("*").append(i + 1).append(". 📦 Мультиадрес (").append(order.getTotalStops()).append(" точек)*\n");
+                
+                // Показываем маршрут (если есть точки)
+                List<org.example.flower_delivery.model.OrderStop> stops = orderService.getOrderStops(order.getId());
+                if (!stops.isEmpty()) {
+                    for (org.example.flower_delivery.model.OrderStop stop : stops) {
+                        String statusIcon = stop.isDelivered() ? "✅" : "📍";
+                        sb.append("   ").append(statusIcon).append(" ").append(stop.getRecipientName());
+                        sb.append(" — ").append(stop.getDeliveryAddress()).append("\n");
+                    }
+                } else {
+                    // Fallback если точки не загрузились
+                    sb.append("   📍 ").append(order.getDeliveryAddress()).append("\n");
+                }
+                
+            } else {
+                // Обычный заказ (1 точка)
+                sb.append("*").append(i + 1).append(". ").append(order.getRecipientName()).append("*\n");
+                sb.append("   📍 ").append(order.getDeliveryAddress()).append("\n");
+            }
+            
             sb.append("   💰 ").append(order.getDeliveryPrice()).append("₽\n");
             sb.append("   📊 Статус: ").append(order.getStatus().getDisplayName()).append("\n");
             
@@ -177,8 +230,29 @@ public class Bot extends TelegramLongPollingBot {
             
             sb.append("\n");
         }
+
+        // Сохраняем список последних заказов для выбора по номеру
+        myOrdersSelectionHandler.saveLastOrders(telegramId, orders);
+
+        // Кнопка для выбора заказа по номеру / ID
+        List<List<InlineKeyboardButton>> keyboard = new ArrayList<>();
+        InlineKeyboardButton selectBtn = InlineKeyboardButton.builder()
+                .text("🔎 Выбрать заказ")
+                .callbackData("orders_select")
+                .build();
+        keyboard.add(List.of(selectBtn));
         
-        sendSimpleMessage(chatId, sb.toString());
+        // Отправляем сообщение с текстом списка и (если есть) с клавиатурой под ним
+        SendMessage message = new SendMessage();
+        message.setChatId(chatId.toString());
+        message.setText(sb.toString());
+        message.setParseMode("Markdown");
+        message.setReplyMarkup(new InlineKeyboardMarkup(keyboard));
+        try {
+            execute(message);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки списка заказов: chatId={}", chatId, e);
+        }
     }
     
     /**

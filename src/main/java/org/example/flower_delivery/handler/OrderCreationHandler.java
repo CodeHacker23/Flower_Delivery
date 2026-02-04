@@ -348,12 +348,349 @@ public class OrderCreationHandler {
         if (data == null) return;
         
         data.setDeliveryPrice(price);
-        data.setState(OrderCreationState.WAITING_COMMENT);
         
+        // Спрашиваем комментарий к этой точке
+        data.setState(OrderCreationState.WAITING_STOP_COMMENT);
         sendMessage(chatId, "✅ Цена: *" + price + "₽*\n\n" +
-                "Шаг 6 из 6\n" +
-                "Введи *комментарий* (особые пожелания)\n" +
-                "или отправь /skip чтобы пропустить:");
+                "Введите *комментарий* к этой точке\n" +
+                "_Пример: домофон 123, позвонить за 10 мин_\n\n" +
+                "или отправьте /skip чтобы пропустить:");
+    }
+    
+    /**
+     * Обработка комментария к первой точке.
+     */
+    private void handleStopComment(Long chatId, Long telegramId, String text, OrderCreationData data) {
+        // Если не /skip — сохраняем комментарий
+        if (!text.equals("/skip")) {
+            data.setComment(text); // временно сохраняем в общий комментарий
+        }
+        
+        // Сохраняем первую точку в список
+        data.saveFirstStopFromFields();
+        
+        // Если был комментарий - добавляем его к точке
+        if (!text.equals("/skip") && !data.getStops().isEmpty()) {
+            data.getStops().get(0).setComment(text);
+        }
+        
+        // Спрашиваем про дополнительную точку
+        askAddAdditionalStop(chatId, data);
+    }
+    
+    // ============================================
+    // МУЛЬТИАДРЕСНАЯ ДОСТАВКА
+    // ============================================
+    
+    /**
+     * Спросить: добавить ещё адрес?
+     */
+    private void askAddAdditionalStop(Long chatId, OrderCreationData data) {
+        data.setState(OrderCreationState.WAITING_ASK_ADDITIONAL_STOP);
+        
+        int currentStops = data.getStops().size();
+        BigDecimal totalPrice = data.getTotalPrice();
+        
+        String text = "✅ *Точка " + currentStops + " добавлена!*\n" +
+                "💰 Текущая сумма: *" + totalPrice + "₽*\n\n" +
+                "➕ *Добавить ещё один адрес доставки?*";
+        
+        InlineKeyboardButton yesBtn = InlineKeyboardButton.builder()
+                .text("➕ Добавить адрес")
+                .callbackData("add_stop_yes")
+                .build();
+        
+        InlineKeyboardButton noBtn = InlineKeyboardButton.builder()
+                .text("✅ Завершить")
+                .callbackData("add_stop_no")
+                .build();
+        
+        InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
+                .keyboardRow(List.of(yesBtn, noBtn))
+                .build();
+        
+        SendMessage message = new SendMessage();
+        message.setChatId(chatId.toString());
+        message.setText(text);
+        message.setParseMode("Markdown");
+        message.setReplyMarkup(keyboard);
+        
+        try {
+            bot.execute(message);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки: chatId={}", chatId, e);
+        }
+    }
+    
+    /**
+     * Обработка ответа: добавить ещё адрес? (из callback)
+     */
+    public void handleAddStopDecision(Long telegramId, Long chatId, boolean addMore) {
+        OrderCreationData data = dataMap.get(telegramId);
+        if (data == null) return;
+        
+        if (addMore) {
+            // Начинаем ввод дополнительной точки
+            data.startNewStop();
+            data.setState(OrderCreationState.WAITING_ADDITIONAL_RECIPIENT_NAME);
+            
+            int stopNumber = data.getStops().size() + 1;
+            
+            sendMessage(chatId, "📍 *Дополнительная точка #" + stopNumber + "*\n\n" +
+                    "Введите *имя получателя*:");
+        } else {
+            // Сразу создаём заказ (комментарии уже есть у каждой точки)
+            finalizeOrder(telegramId, chatId, data);
+        }
+    }
+    
+    /**
+     * Финализация и создание заказа.
+     */
+    private void finalizeOrder(Long telegramId, Long chatId, OrderCreationData data) {
+        // Получаем магазин юзера
+        Shop shop = shopService.findByUserTelegramId(telegramId).orElse(null);
+
+        if (shop == null) {
+            sendMessage(chatId, "❌ Ошибка: магазин не найден!");
+            dataMap.remove(telegramId);
+            return;
+        }
+
+        try {
+            Order order;
+            
+            if (data.isMultiStop()) {
+                order = createMultiStopOrder(shop, data);
+            } else {
+                order = createSingleStopOrder(shop, data);
+            }
+
+            dataMap.remove(telegramId);
+            String confirmationMessage = buildOrderConfirmation(data, order);
+            sendMessage(chatId, confirmationMessage);
+
+        } catch (Exception e) {
+            log.error("Ошибка создания заказа: telegramId={}", telegramId, e);
+            dataMap.remove(telegramId);
+            sendMessage(chatId, "❌ Ошибка при создании заказа: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Склонение слова "точка"
+     */
+    private String getStopsWord(int count) {
+        if (count == 1) return "точка";
+        if (count >= 2 && count <= 4) return "точки";
+        return "точек";
+    }
+    
+    /**
+     * Обработка имени получателя дополнительной точки.
+     */
+    private void handleAdditionalRecipientName(Long chatId, Long telegramId, String text, OrderCreationData data) {
+        if (text.length() < 2) {
+            sendMessage(chatId, "❌ Имя слишком короткое. Минимум 2 символа:");
+            return;
+        }
+        
+        data.getCurrentStop().setRecipientName(text);
+        data.setState(OrderCreationState.WAITING_ADDITIONAL_RECIPIENT_PHONE);
+        
+        sendMessage(chatId, "✅ Получатель: *" + text + "*\n\n" +
+                "Введите *телефон получателя*:");
+    }
+    
+    /**
+     * Обработка телефона получателя дополнительной точки.
+     */
+    private void handleAdditionalRecipientPhone(Long chatId, Long telegramId, String text, OrderCreationData data) {
+        if (text.length() < 5) {
+            sendMessage(chatId, "❌ Телефон слишком короткий:");
+            return;
+        }
+        
+        data.getCurrentStop().setRecipientPhone(text);
+        data.setState(OrderCreationState.WAITING_ADDITIONAL_ADDRESS);
+        
+        sendMessage(chatId, "✅ Телефон: *" + text + "*\n\n" +
+                "Введите *адрес доставки*:\n" +
+                "_Пример: ул. Ленина 46, кв. 20_");
+    }
+    
+    /**
+     * Обработка адреса дополнительной точки.
+     */
+    private void handleAdditionalAddress(Long chatId, Long telegramId, String text, OrderCreationData data) {
+        if (text.length() < 10) {
+            sendMessage(chatId, "❌ Адрес слишком короткий:");
+            return;
+        }
+        
+        data.getCurrentStop().setDeliveryAddress(text);
+        
+        // Пробуем геокодировать
+        sendMessage(chatId, "🔍 Определяю расстояние...");
+        
+        Optional<GeocodingService.GeocodingResult> geocodeResult = geocodingService.geocode(text);
+        
+        if (geocodeResult.isEmpty()) {
+            // Не удалось — ручной ввод
+            data.setState(OrderCreationState.WAITING_ADDITIONAL_PRICE);
+            sendMessage(chatId, "⚠️ Не удалось определить адрес автоматически.\n\n" +
+                    "Введите *стоимость доставки* до этой точки:\n" +
+                    "_Минимум 300₽_");
+            return;
+        }
+        
+        GeocodingService.GeocodingResult geo = geocodeResult.get();
+        
+        // Сохраняем координаты
+        data.getCurrentStop().setDeliveryLatitude(geo.latitude());
+        data.getCurrentStop().setDeliveryLongitude(geo.longitude());
+        
+        // Получаем координаты предыдущей точки
+        double[] prevCoords = data.getLastStopCoordinates();
+        
+        if (prevCoords == null) {
+            // Нет координат предыдущей точки — ручной ввод
+            data.setState(OrderCreationState.WAITING_ADDITIONAL_PRICE);
+            sendMessage(chatId, "✅ Адрес найден: *" + geo.fullAddress() + "*\n\n" +
+                    "⚠️ Не удалось рассчитать расстояние.\n\n" +
+                    "Введите *стоимость доставки* до этой точки:\n" +
+                    "_Минимум 300₽_");
+            return;
+        }
+        
+        // Считаем расстояние от предыдущей точки
+        DeliveryPriceService.DeliveryCalculation calc = deliveryPriceService.calculateAdditionalStop(
+                prevCoords[0], prevCoords[1], geo.latitude(), geo.longitude()
+        );
+        
+        data.getCurrentStop().setDistanceKm(calc.distanceKm());
+        data.getCurrentStop().setSuggestedPrice(calc.price());
+        data.setState(OrderCreationState.WAITING_ADDITIONAL_PRICE_CONFIRMATION);
+        
+        // Показываем подтверждение цены
+        sendAdditionalPriceConfirmation(chatId, geo.fullAddress(), calc);
+    }
+    
+    /**
+     * Отправить сообщение с подтверждением цены дополнительной точки.
+     */
+    private void sendAdditionalPriceConfirmation(Long chatId, String address, DeliveryPriceService.DeliveryCalculation calc) {
+        String text = "✅ *Адрес найден:*\n" + address + "\n\n" +
+                "📏 *Расстояние от предыдущей точки:* " + calc.distanceKm() + " км\n" +
+                "💰 *Рекомендуемая цена:* +" + calc.price() + "₽\n\n" +
+                "Подтвердите цену или введите свою:";
+        
+        InlineKeyboardButton confirmBtn = InlineKeyboardButton.builder()
+                .text("✅ Подтвердить +" + calc.price() + "₽")
+                .callbackData("confirm_additional_price_" + calc.price())
+                .build();
+        
+        InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
+                .keyboardRow(List.of(confirmBtn))
+                .build();
+        
+        SendMessage message = new SendMessage();
+        message.setChatId(chatId.toString());
+        message.setText(text);
+        message.setParseMode("Markdown");
+        message.setReplyMarkup(keyboard);
+        
+        try {
+            bot.execute(message);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки: chatId={}", chatId, e);
+        }
+    }
+    
+    /**
+     * Обработка подтверждения цены дополнительной точки (из callback).
+     */
+    public void handleAdditionalPriceConfirmation(Long telegramId, Long chatId, BigDecimal price) {
+        OrderCreationData data = dataMap.get(telegramId);
+        if (data == null || data.getCurrentStop() == null) return;
+        
+        data.getCurrentStop().setDeliveryPrice(price);
+        
+        // Спрашиваем комментарий к этой точке
+        data.setState(OrderCreationState.WAITING_ADDITIONAL_STOP_COMMENT);
+        sendMessage(chatId, "✅ Цена: *+" + price + "₽*\n\n" +
+                "Введите *комментарий* к этой точке\n" +
+                "_Пример: домофон 456, этаж 5_\n\n" +
+                "или отправьте /skip чтобы пропустить:");
+    }
+    
+    /**
+     * Обработка комментария к дополнительной точке.
+     */
+    private void handleAdditionalStopComment(Long chatId, Long telegramId, String text, OrderCreationData data) {
+        // Если не /skip — сохраняем комментарий
+        if (!text.equals("/skip") && data.getCurrentStop() != null) {
+            data.getCurrentStop().setComment(text);
+        }
+        
+        // Сохраняем точку в список
+        data.saveCurrentStop();
+        
+        // Спрашиваем про ещё одну точку
+        askAddAdditionalStop(chatId, data);
+    }
+    
+    /**
+     * Обработка ручного ввода цены дополнительной точки.
+     */
+    private void handleAdditionalManualPrice(Long chatId, Long telegramId, String text, OrderCreationData data) {
+        try {
+            BigDecimal price = new BigDecimal(text.replace(",", "."));
+            BigDecimal minPrice = deliveryPriceService.getMinAdditionalStopPrice();
+            
+            if (price.compareTo(minPrice) < 0) {
+                sendMessage(chatId, "❌ Минимальная цена — *" + minPrice + "₽*\n" +
+                        "Введите цену от " + minPrice + "₽:");
+                return;
+            }
+            
+            data.getCurrentStop().setDeliveryPrice(price);
+            
+            // Спрашиваем комментарий к этой точке
+            data.setState(OrderCreationState.WAITING_ADDITIONAL_STOP_COMMENT);
+            sendMessage(chatId, "✅ Цена: *+" + price + "₽*\n\n" +
+                    "Введите *комментарий* к этой точке\n" +
+                    "или отправьте /skip чтобы пропустить:");
+            
+        } catch (NumberFormatException e) {
+            sendMessage(chatId, "❌ Введите число (например: 300):");
+        }
+    }
+    
+    /**
+     * Обработка ручного ввода цены дополнительной точки (когда геокодирование не удалось).
+     */
+    private void handleAdditionalPrice(Long chatId, Long telegramId, String text, OrderCreationData data) {
+        try {
+            BigDecimal price = new BigDecimal(text.replace(",", "."));
+            BigDecimal minPrice = deliveryPriceService.getMinAdditionalStopPrice();
+            
+            if (price.compareTo(minPrice) < 0) {
+                sendMessage(chatId, "❌ Минимальная цена — *" + minPrice + "₽*:");
+                return;
+            }
+            
+            data.getCurrentStop().setDeliveryPrice(price);
+            
+            // Спрашиваем комментарий к этой точке
+            data.setState(OrderCreationState.WAITING_ADDITIONAL_STOP_COMMENT);
+            sendMessage(chatId, "✅ Цена: *+" + price + "₽*\n\n" +
+                    "Введите *комментарий* к этой точке\n" +
+                    "или отправьте /skip чтобы пропустить:");
+            
+        } catch (NumberFormatException e) {
+            sendMessage(chatId, "❌ Введите число:");
+        }
     }
 
 
@@ -373,12 +710,13 @@ public class OrderCreationHandler {
             }
 
             data.setDeliveryPrice(price);
-            data.setState(OrderCreationState.WAITING_COMMENT);
-
+            
+            // Спрашиваем комментарий к этой точке
+            data.setState(OrderCreationState.WAITING_STOP_COMMENT);
             sendMessage(chatId, "✅ Цена: *" + price + "₽*\n\n" +
-                    "Шаг 6 из 6\n" +
-                    "Введи *комментарий* (особые пожелания)\n" +
-                    "или отправь /skip чтобы пропустить:");
+                    "Введите *комментарий* к этой точке\n" +
+                    "_Пример: домофон 123, позвонить за 10 мин_\n\n" +
+                    "или отправьте /skip чтобы пропустить:");
 
         } catch (NumberFormatException e) {
             sendMessage(chatId, "❌ Некорректное число. Введи цену цифрами или нажми кнопку выше:");
@@ -400,12 +738,13 @@ public class OrderCreationHandler {
             }
 
             data.setDeliveryPrice(price);
-            data.setState(OrderCreationState.WAITING_COMMENT);
-
+            
+            // Спрашиваем комментарий к этой точке
+            data.setState(OrderCreationState.WAITING_STOP_COMMENT);
             sendMessage(chatId, "✅ Цена: *" + price + "₽*\n\n" +
-                    "Шаг 6 из 6\n" +
-                    "Введи *комментарий* (особые пожелания)\n" +
-                    "или отправь /skip чтобы пропустить:");
+                    "Введите *комментарий* к этой точке\n" +
+                    "_Пример: домофон 123, позвонить за 10 мин_\n\n" +
+                    "или отправьте /skip чтобы пропустить:");
 
         } catch (NumberFormatException e) {
             sendMessage(chatId, "❌ Некорректное число. Введи цену цифрами (например: 350):");
@@ -413,7 +752,7 @@ public class OrderCreationHandler {
     }
 
     /**
-     * Шаг 5: Обработка комментария и создание заказа.
+     * Финальный шаг: Обработка комментария и создание заказа.
      */
     private void handleComment(Long chatId, Long telegramId, String text, OrderCreationData data) {
         // Если не /skip — сохраняем комментарий
@@ -431,50 +770,139 @@ public class OrderCreationHandler {
             return;
         }
 
-        // Создаём заказ (с координатами если есть)
         try {
-            Order order = orderService.createOrder(
-                    shop,
-                    data.getRecipientName(),
-                    data.getRecipientPhone(),
-                    data.getDeliveryAddress(),
-                    data.getDeliveryPrice(),
-                    data.getComment(),
-                    data.getDeliveryDate(),
-                    data.getDeliveryLatitude(),
-                    data.getDeliveryLongitude()
-            );
+            Order order;
+            
+            if (data.isMultiStop()) {
+                // МУЛЬТИАДРЕСНЫЙ ЗАКАЗ
+                order = createMultiStopOrder(shop, data);
+            } else {
+                // ОБЫЧНЫЙ ЗАКАЗ (1 точка)
+                order = createSingleStopOrder(shop, data);
+            }
 
             // Очищаем данные
             dataMap.remove(telegramId);
 
-            String dateStr = data.getDeliveryDate().equals(LocalDate.now()) ? "сегодня" : "завтра";
-            
             // Формируем сообщение
-            StringBuilder msg = new StringBuilder();
-            msg.append("🎉 *Заказ создан!*\n\n");
-            msg.append("📋 *Данные заказа:*\n");
-            msg.append("• Дата: ").append(dateStr).append(" (").append(data.getDeliveryDate().format(DateTimeFormatter.ofPattern("dd.MM"))).append(")\n");
-            msg.append("• Получатель: ").append(data.getRecipientName()).append("\n");
-            msg.append("• Телефон: ").append(data.getRecipientPhone()).append("\n");
-            msg.append("• Адрес: ").append(data.getDeliveryAddress()).append("\n");
-            
-            // Показываем расстояние если есть
-            if (data.getDistanceKm() != null) {
-                msg.append("• Расстояние: ").append(data.getDistanceKm()).append(" км\n");
-            }
-            
-            msg.append("• Цена: ").append(data.getDeliveryPrice()).append("₽\n");
-            msg.append("• Комментарий: ").append(data.getComment() != null ? data.getComment() : "—").append("\n\n");
-            msg.append("⏳ Ожидайте, скоро курьер возьмёт заказ!");
-            
-            sendMessage(chatId, msg.toString());
+            String confirmationMessage = buildOrderConfirmation(data, order);
+            sendMessage(chatId, confirmationMessage);
 
         } catch (Exception e) {
             log.error("Ошибка создания заказа: telegramId={}", telegramId, e);
             dataMap.remove(telegramId);
             sendMessage(chatId, "❌ Ошибка при создании заказа: " + e.getMessage());
         }
+    }
+    
+    /**
+     * Создать обычный заказ (1 точка).
+     */
+    private Order createSingleStopOrder(Shop shop, OrderCreationData data) {
+        // Если есть точки в списке — берём первую
+        if (!data.getStops().isEmpty()) {
+            OrderCreationData.StopData stop = data.getStops().get(0);
+            return orderService.createOrder(
+                    shop,
+                    stop.getRecipientName(),
+                    stop.getRecipientPhone(),
+                    stop.getDeliveryAddress(),
+                    stop.getDeliveryPrice(),
+                    data.getComment(),
+                    data.getDeliveryDate(),
+                    stop.getDeliveryLatitude(),
+                    stop.getDeliveryLongitude()
+            );
+        }
+        
+        // Иначе из полей
+        return orderService.createOrder(
+                shop,
+                data.getRecipientName(),
+                data.getRecipientPhone(),
+                data.getDeliveryAddress(),
+                data.getDeliveryPrice(),
+                data.getComment(),
+                data.getDeliveryDate(),
+                data.getDeliveryLatitude(),
+                data.getDeliveryLongitude()
+        );
+    }
+    
+    /**
+     * Создать мультиадресный заказ (несколько точек).
+     */
+    private Order createMultiStopOrder(Shop shop, OrderCreationData data) {
+        return orderService.createMultiStopOrder(
+                shop,
+                data.getDeliveryDate(),
+                data.getComment(),
+                data.getStops()
+        );
+    }
+    
+    /**
+     * Сформировать сообщение подтверждения заказа.
+     */
+    private String buildOrderConfirmation(OrderCreationData data, Order order) {
+        String dateStr = data.getDeliveryDate().equals(LocalDate.now()) ? "сегодня" : "завтра";
+        StringBuilder msg = new StringBuilder();
+        
+        if (data.isMultiStop()) {
+            // Мультиадресный заказ
+            msg.append("🎉 *Заказ создан!*\n\n");
+            msg.append("📦 *Мультиадресная доставка*\n");
+            msg.append("📅 Дата: ").append(dateStr).append(" (")
+               .append(data.getDeliveryDate().format(DateTimeFormatter.ofPattern("dd.MM"))).append(")\n\n");
+            
+            for (int i = 0; i < data.getStops().size(); i++) {
+                OrderCreationData.StopData stop = data.getStops().get(i);
+                msg.append("📍 *Точка ").append(i + 1).append(":*\n");
+                msg.append("• Получатель: ").append(stop.getRecipientName()).append("\n");
+                msg.append("• Телефон: ").append(stop.getRecipientPhone()).append("\n");
+                msg.append("• Адрес: ").append(stop.getDeliveryAddress()).append("\n");
+                if (stop.getDistanceKm() != null) {
+                    msg.append("• Расстояние: ").append(stop.getDistanceKm()).append(" км\n");
+                }
+                msg.append("• Цена: ").append(stop.getDeliveryPrice()).append("₽\n");
+                if (stop.getComment() != null && !stop.getComment().isEmpty()) {
+                    msg.append("• Комментарий: ").append(stop.getComment()).append("\n");
+                }
+                msg.append("\n");
+            }
+            
+            msg.append("💰 *ИТОГО: ").append(data.getTotalPrice()).append("₽*\n\n");
+            msg.append("⏳ Ожидайте, скоро курьер возьмёт заказ!");
+            
+        } else {
+            // Обычный заказ (1 точка)
+            msg.append("🎉 *Заказ создан!*\n\n");
+            msg.append("📋 *Данные заказа:*\n");
+            msg.append("• Дата: ").append(dateStr).append(" (")
+               .append(data.getDeliveryDate().format(DateTimeFormatter.ofPattern("dd.MM"))).append(")\n");
+            
+            OrderCreationData.StopData stop = data.getStops().isEmpty() ? null : data.getStops().get(0);
+            String recipientName = stop != null ? stop.getRecipientName() : data.getRecipientName();
+            String recipientPhone = stop != null ? stop.getRecipientPhone() : data.getRecipientPhone();
+            String address = stop != null ? stop.getDeliveryAddress() : data.getDeliveryAddress();
+            Double distance = stop != null ? stop.getDistanceKm() : data.getDistanceKm();
+            BigDecimal price = stop != null ? stop.getDeliveryPrice() : data.getDeliveryPrice();
+            String comment = stop != null ? stop.getComment() : data.getComment();
+            
+            msg.append("• Получатель: ").append(recipientName).append("\n");
+            msg.append("• Телефон: ").append(recipientPhone).append("\n");
+            msg.append("• Адрес: ").append(address).append("\n");
+            if (distance != null) {
+                msg.append("• Расстояние: ").append(distance).append(" км\n");
+            }
+            msg.append("• Цена: ").append(price).append("₽\n");
+            if (comment != null && !comment.isEmpty()) {
+                msg.append("• Комментарий: ").append(comment).append("\n");
+            }
+            msg.append("\n⏳ Ожидайте, скоро курьер возьмёт заказ!");
+        }
+        
+        return msg.toString();
     }
 
 
@@ -502,6 +930,7 @@ public class OrderCreationHandler {
         // Обрабатываем в зависимости от текущего шага
 
         switch (data.getState()) {
+            // ===== ОСНОВНАЯ ТОЧКА =====
             case WAITING_RECIPIENT_NAME:
                 handleRecipientName(chatId, telegramId, text, data);
                 break;
@@ -518,7 +947,40 @@ public class OrderCreationHandler {
             case WAITING_DELIVERY_PRICE:
                 handleDeliveryPrice(chatId, telegramId, text, data);
                 break;
+            case WAITING_STOP_COMMENT:
+                // Комментарий к первой точке
+                handleStopComment(chatId, telegramId, text, data);
+                break;
+                
+            // ===== ДОПОЛНИТЕЛЬНЫЕ ТОЧКИ =====
+            case WAITING_ASK_ADDITIONAL_STOP:
+                // Это состояние обрабатывается через callback, не текст
+                sendMessage(chatId, "👆 Нажмите кнопку выше");
+                break;
+            case WAITING_ADDITIONAL_RECIPIENT_NAME:
+                handleAdditionalRecipientName(chatId, telegramId, text, data);
+                break;
+            case WAITING_ADDITIONAL_RECIPIENT_PHONE:
+                handleAdditionalRecipientPhone(chatId, telegramId, text, data);
+                break;
+            case WAITING_ADDITIONAL_ADDRESS:
+                handleAdditionalAddress(chatId, telegramId, text, data);
+                break;
+            case WAITING_ADDITIONAL_PRICE_CONFIRMATION:
+                // Юзер ввёл свою цену вместо подтверждения
+                handleAdditionalManualPrice(chatId, telegramId, text, data);
+                break;
+            case WAITING_ADDITIONAL_PRICE:
+                handleAdditionalPrice(chatId, telegramId, text, data);
+                break;
+            case WAITING_ADDITIONAL_STOP_COMMENT:
+                // Комментарий к дополнительной точке
+                handleAdditionalStopComment(chatId, telegramId, text, data);
+                break;
+                
+            // ===== ЗАВЕРШЕНИЕ (для обратной совместимости) =====
             case WAITING_COMMENT:
+                // Этот кейс теперь не используется, но оставляем для безопасности
                 handleComment(chatId, telegramId, text, data);
                 break;
             default:

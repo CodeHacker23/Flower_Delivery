@@ -8,6 +8,8 @@ import org.hibernate.annotations.UpdateTimestamp;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 @Entity
@@ -185,6 +187,40 @@ public class Order {
     private LocalDateTime deliveredAt;
 
     // ============================================
+    // МУЛЬТИАДРЕСНАЯ ДОСТАВКА
+    // ============================================
+
+    /**
+     * Флаг мультиадресного заказа.
+     * true = заказ имеет несколько точек доставки.
+     */
+    @Column(name = "is_multi_stop", nullable = false)
+    @Builder.Default
+    private Boolean isMultiStop = false;
+
+    /**
+     * Количество точек доставки.
+     * 1 = обычный заказ
+     * 2+ = мультиадресный заказ
+     */
+    @Column(name = "total_stops", nullable = false)
+    @Builder.Default
+    private Integer totalStops = 1;
+
+    /**
+     * Точки доставки для мультиадресных заказов.
+     * Для обычных заказов — пустой список.
+     * 
+     * mappedBy = "order" — связь определена в OrderStop.order
+     * cascade = ALL — при удалении заказа удаляются и все точки
+     * orphanRemoval = true — при удалении точки из списка она удаляется из БД
+     */
+    @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
+    @OrderBy("stopNumber ASC")
+    @Builder.Default
+    private List<OrderStop> stops = new ArrayList<>();
+
+    // ============================================
     // ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
     // ============================================
 
@@ -235,5 +271,83 @@ public class Order {
             return false;
         }
         return LocalDateTime.now().isAfter(deadline);
+    }
+
+    // ============================================
+    // МЕТОДЫ ДЛЯ МУЛЬТИАДРЕСНЫХ ЗАКАЗОВ
+    // ============================================
+
+    /**
+     * Это мультиадресный заказ?
+     */
+    public boolean isMultiStopOrder() {
+        return Boolean.TRUE.equals(isMultiStop) || totalStops > 1;
+    }
+
+    /**
+     * Добавить точку доставки.
+     * Автоматически обновляет счётчики.
+     *
+     * @param stop точка доставки
+     */
+    public void addStop(OrderStop stop) {
+        stops.add(stop);
+        stop.setOrder(this);
+        this.totalStops = stops.size();
+        this.isMultiStop = stops.size() > 1;
+    }
+
+    /**
+     * Получить общую стоимость доставки (сумма всех точек).
+     *
+     * @return сумма deliveryPrice всех точек
+     */
+    public BigDecimal getTotalDeliveryPrice() {
+        if (stops == null || stops.isEmpty()) {
+            return deliveryPrice;
+        }
+        return stops.stream()
+                .map(OrderStop::getDeliveryPrice)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
+
+    /**
+     * Все точки доставлены?
+     *
+     * @return true если все точки имеют статус DELIVERED
+     */
+    public boolean areAllStopsDelivered() {
+        if (stops == null || stops.isEmpty()) {
+            return status == OrderStatus.DELIVERED;
+        }
+        return stops.stream().allMatch(OrderStop::isDelivered);
+    }
+
+    /**
+     * Получить следующую недоставленную точку.
+     *
+     * @return следующая точка со статусом PENDING или empty
+     */
+    public java.util.Optional<OrderStop> getNextPendingStop() {
+        if (stops == null) {
+            return java.util.Optional.empty();
+        }
+        return stops.stream()
+                .filter(s -> s.getStopStatus() == StopStatus.PENDING)
+                .findFirst();
+    }
+
+    /**
+     * Получить краткое описание маршрута.
+     * Пример: "Ленина 15 → Ленина 17 → Труда 10"
+     */
+    public String getRouteDescription() {
+        if (stops == null || stops.isEmpty()) {
+            return deliveryAddress;
+        }
+        return stops.stream()
+                .map(OrderStop::getDeliveryAddress)
+                .reduce((a, b) -> a + " → " + b)
+                .orElse(deliveryAddress);
     }
 }

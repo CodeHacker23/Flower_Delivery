@@ -303,4 +303,100 @@ public class DeliveryPriceService {
         }
         return sb.toString();
     }
+
+    // ============================================
+    // МУЛЬТИАДРЕСНАЯ ДОСТАВКА
+    // ============================================
+
+    /**
+     * Минимальная цена за дополнительную точку.
+     * Даже если расстояние очень маленькое — минимум 300₽.
+     */
+    private static final BigDecimal MIN_ADDITIONAL_STOP_PRICE = new BigDecimal("300");
+
+    /**
+     * Рассчитать доставку для ДОПОЛНИТЕЛЬНОЙ точки.
+     *
+     * Логика:
+     * 1. Расстояние считаем от ПРЕДЫДУЩЕЙ точки, а не от магазина
+     * 2. По этому расстоянию берём цену из той же тарифной сетки, что и обычную доставку
+     * 3. Но не меньше MIN_ADDITIONAL_STOP_PRICE (минимум 300₽ за доп. точку)
+     *
+     * @param prevLat     Широта предыдущей точки
+     * @param prevLon     Долгота предыдущей точки
+     * @param deliveryLat Широта новой точки
+     * @param deliveryLon Долгота новой точки
+     * @return Результат расчёта
+     */
+    public DeliveryCalculation calculateAdditionalStop(double prevLat, double prevLon,
+                                                        double deliveryLat, double deliveryLon) {
+        // Пробуем получить расстояние через OSRM
+        Double roadDistance = getOsrmDistance(prevLat, prevLon, deliveryLat, deliveryLon);
+        
+        // Если OSRM не сработал — используем коэффициент
+        if (roadDistance == null) {
+            double straightDistance = calculateDistance(prevLat, prevLon, deliveryLat, deliveryLon);
+            roadDistance = straightDistance * ROAD_DISTANCE_COEFFICIENT;
+            log.warn("OSRM недоступен для доп. точки, используем коэффициент: {} км", 
+                    String.format("%.1f", roadDistance));
+        }
+        
+        // Расчёт цены для дополнительной точки:
+        // используем ту же тарифную сетку, что и для основной доставки
+        BigDecimal price = getPriceByDistance(roadDistance);
+        if (price.compareTo(MIN_ADDITIONAL_STOP_PRICE) < 0) {
+            price = MIN_ADDITIONAL_STOP_PRICE;
+        }
+        
+        // Округляем расстояние до 1 знака
+        double roundedDistance = Math.round(roadDistance * 10.0) / 10.0;
+        
+        String description = String.format("➕ +%.1f км — %s₽", roundedDistance, price);
+        
+        log.info("Расчёт доп. точки: {} км = {}₽", roundedDistance, price);
+        
+        return new DeliveryCalculation(roundedDistance, price, description);
+    }
+
+    /**
+     * Получить минимальную цену для дополнительной точки.
+     */
+    public BigDecimal getMinAdditionalStopPrice() {
+        return MIN_ADDITIONAL_STOP_PRICE;
+    }
+
+    /**
+     * Рассчитать ОБЩУЮ стоимость мультиадресной доставки.
+     * 
+     * @param shopLat координаты магазина
+     * @param shopLon координаты магазина
+     * @param stops   список точек [lat1, lon1, lat2, lon2, ...]
+     * @return массив цен для каждой точки
+     */
+    public BigDecimal[] calculateMultiStopDelivery(double shopLat, double shopLon, 
+                                                    double[][] stops) {
+        if (stops == null || stops.length == 0) {
+            return new BigDecimal[0];
+        }
+        
+        BigDecimal[] prices = new BigDecimal[stops.length];
+        
+        // Первая точка — от магазина, полная цена
+        DeliveryCalculation first = calculate(shopLat, shopLon, stops[0][0], stops[0][1]);
+        prices[0] = first.price();
+        
+        // Остальные точки — от предыдущей точки, цена дополнительной точки
+        for (int i = 1; i < stops.length; i++) {
+            DeliveryCalculation additional = calculateAdditionalStop(
+                    stops[i-1][0], stops[i-1][1],  // Предыдущая точка
+                    stops[i][0], stops[i][1]        // Текущая точка
+            );
+            prices[i] = additional.price();
+        }
+        
+        log.info("Мультиадресная доставка: {} точек, цены: {}", 
+                stops.length, java.util.Arrays.toString(prices));
+        
+        return prices;
+    }
 }

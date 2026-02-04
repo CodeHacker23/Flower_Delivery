@@ -14,7 +14,12 @@ import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
 import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+
+import java.util.List;
+import java.util.UUID;
 
 /**
  * Обработчик callback query - это когда пользователь нажимает на Inline кнопку
@@ -95,6 +100,17 @@ public class CallbackQueryHandler {
     // Сервис магазинов (для показа информации о магазине)
     private final ShopService shopService;
 
+    // Сервис заказов (для отмены и редактирования)
+    private final org.example.flower_delivery.service.OrderService orderService;
+
+    @Autowired
+    @Lazy
+    private OrderEditHandler orderEditHandler;
+
+    @Autowired
+    @Lazy
+    private MyOrdersSelectionHandler myOrdersSelectionHandler;
+
     /**
      * Обработать callback query (нажатие на кнопку)
      *
@@ -137,6 +153,51 @@ public class CallbackQueryHandler {
                 String priceStr = callbackData.replace("confirm_price_", "");
                 answerCallbackQuery(callbackQuery.getId(), "✅ Цена подтверждена");
                 orderCreationHandler.handlePriceConfirmation(telegramId, chatId, new java.math.BigDecimal(priceStr));
+                
+            // ===== МУЛЬТИАДРЕСНЫЕ ЗАКАЗЫ =====
+            } else if (callbackData.equals("add_stop_yes")) {
+                // Пользователь хочет добавить ещё одну точку
+                answerCallbackQuery(callbackQuery.getId(), "➕ Добавляем адрес...");
+                orderCreationHandler.handleAddStopDecision(telegramId, chatId, true);
+                
+            } else if (callbackData.equals("add_stop_no")) {
+                // Пользователь не хочет добавлять больше точек
+                answerCallbackQuery(callbackQuery.getId(), "✅ Завершаем...");
+                orderCreationHandler.handleAddStopDecision(telegramId, chatId, false);
+                
+            } else if (callbackData.startsWith("confirm_additional_price_")) {
+                // Подтверждение цены дополнительной точки
+                String priceStr = callbackData.replace("confirm_additional_price_", "");
+                answerCallbackQuery(callbackQuery.getId(), "✅ Цена подтверждена");
+                orderCreationHandler.handleAdditionalPriceConfirmation(telegramId, chatId, new java.math.BigDecimal(priceStr));
+
+            // ===== МОИ ЗАКАЗЫ: ОТМЕНА И РЕДАКТИРОВАНИЕ =====
+            } else if (callbackData.startsWith("order_cancel_ok_")) {
+                // Пользователь подтвердил отмену заказа
+                String orderIdStr = callbackData.replace("order_cancel_ok_", "");
+                answerCallbackQuery(callbackQuery.getId(), "Отменяю заказ...");
+                handleOrderCancelConfirm(chatId, orderIdStr);
+
+            } else if (callbackData.equals("order_cancel_no")) {
+                // Пользователь передумал отменять
+                answerCallbackQuery(callbackQuery.getId(), "Ок, заказ не отменён");
+                sendMessage(chatId, "✅ Заказ остаётся в силе.");
+
+            } else if (callbackData.startsWith("order_cancel_")) {
+                // Нажали "Отменить" под заказом — показываем подтверждение
+                String orderIdStr = callbackData.replace("order_cancel_", "");
+                answerCallbackQuery(callbackQuery.getId(), "Отменить заказ?");
+                handleOrderCancelAsk(chatId, orderIdStr);
+
+            } else if (callbackData.startsWith("order_edit_")) {
+                answerCallbackQuery(callbackQuery.getId(), "✏️ Редактирование");
+                dispatchOrderEdit(telegramId, chatId, callbackData);
+
+            } else if (callbackData.equals("orders_select")) {
+                // Начать выбор заказа по номеру / ID из последнего списка
+                answerCallbackQuery(callbackQuery.getId(), "🔎 Выбор заказа");
+                myOrdersSelectionHandler.startSelection(telegramId, chatId);
+
             } else {
                 log.warn("Неизвестный callback_data: {}", callbackData);
                 answerCallbackQuery(callbackQuery.getId(), "❌ Неизвестная команда");
@@ -242,6 +303,69 @@ public class CallbackQueryHandler {
 
         } catch (TelegramApiException e) {
             log.error("Ошибка при отправке сообщения: chatId={}", chatId, e);
+        }
+    }
+
+    /**
+     * Направить callback order_edit_* в нужный метод OrderEditHandler.
+     */
+    private void dispatchOrderEdit(Long telegramId, Long chatId, String callbackData) {
+        if (callbackData.contains("_date_today") || callbackData.contains("_date_tomorrow")) {
+            orderEditHandler.handleDateSelected(telegramId, chatId, callbackData);
+        } else if (callbackData.contains("_date") && !callbackData.contains("_date_to")) {
+            orderEditHandler.handleEditDateMenu(telegramId, chatId, callbackData);
+        } else if (callbackData.contains("_address") || callbackData.contains("_phone") || callbackData.contains("_comment")) {
+            orderEditHandler.handleSelectField(telegramId, chatId, callbackData);
+        } else if (callbackData.contains("_stop_")) {
+            orderEditHandler.handleSelectPoint(telegramId, chatId, callbackData);
+        } else {
+            orderEditHandler.handleEditMenu(telegramId, chatId, callbackData);
+        }
+    }
+
+    /**
+     * Показать подтверждение отмены заказа: "Точно отменить?" и кнопки [Да] [Нет].
+     */
+    private void handleOrderCancelAsk(Long chatId, String orderIdStr) {
+        String text = "❓ *Точно отменить этот заказ?*";
+        InlineKeyboardButton btnYes = InlineKeyboardButton.builder()
+                .text("Да, отменить")
+                .callbackData("order_cancel_ok_" + orderIdStr)
+                .build();
+        InlineKeyboardButton btnNo = InlineKeyboardButton.builder()
+                .text("Нет")
+                .callbackData("order_cancel_no")
+                .build();
+        InlineKeyboardMarkup markup = new InlineKeyboardMarkup(List.of(List.of(btnYes, btnNo)));
+        SendMessage message = SendMessage.builder()
+                .chatId(chatId.toString())
+                .text(text)
+                .parseMode("Markdown")
+                .replyMarkup(markup)
+                .build();
+        try {
+            bot.execute(message);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки подтверждения отмены: chatId={}", chatId, e);
+        }
+    }
+
+    /**
+     * Выполнить отмену заказа (после нажатия "Да, отменить").
+     */
+    private void handleOrderCancelConfirm(Long chatId, String orderIdStr) {
+        UUID orderId;
+        try {
+            orderId = UUID.fromString(orderIdStr);
+        } catch (IllegalArgumentException e) {
+            sendMessage(chatId, "❌ Ошибка: неверный ID заказа.");
+            return;
+        }
+        boolean cancelled = orderService.cancelOrder(orderId);
+        if (cancelled) {
+            sendMessage(chatId, "✅ *Заказ отменён.*\n\nНажми «📋 Мои заказы», чтобы обновить список.");
+        } else {
+            sendMessage(chatId, "❌ Не удалось отменить заказ.\nВозможно, он уже принят курьером или не найден.");
         }
     }
 
