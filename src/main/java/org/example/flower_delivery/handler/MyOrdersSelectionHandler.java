@@ -119,15 +119,33 @@ public class MyOrdersSelectionHandler {
         }
 
         Order order = orderOpt.get();
-        showOrderActions(chatId, order);
+
+        // Попробуем восстановить \"человеческий\" номер из списка (1..N),
+        // чтобы в карточке показывать ID как \"10\", а не UUID.
+        Integer displayNumber = null;
+        int idxInList = ids.indexOf(orderId);
+        if (idxInList >= 0) {
+            displayNumber = idxInList + 1;
+        }
+
+        showOrderActions(chatId, order, displayNumber);
         return true;
     }
 
     /** Показать краткую карточку заказа с кнопками Редактировать / Отменить. */
-    private void showOrderActions(Long chatId, Order order) {
+    private void showOrderActions(Long chatId, Order order, Integer displayNumber) {
         StringBuilder sb = new StringBuilder();
         sb.append("📦 *Заказ*\n\n");
-        sb.append("ID: `").append(order.getId()).append("`\n");
+
+        // Для пользователя показываем дружелюбный ID:
+        // - если заказ был выбран по номеру из списка, показываем этот номер (1, 2, 10 и т.д.)
+        // - если номер восстановить не удалось, показываем сокращённый UUID (первые 8 символов)
+        if (displayNumber != null) {
+            sb.append("ID: `").append(displayNumber).append("`\n");
+        } else {
+            String shortUuid = order.getId().toString().substring(0, 8);
+            sb.append("ID: `").append(shortUuid).append("`\n");
+        }
         sb.append("Статус: ").append(order.getStatus().getDisplayName()).append("\n");
         sb.append("Адрес: ").append(order.getDeliveryAddress()).append("\n");
         sb.append("Сумма доставки: ").append(order.getDeliveryPrice()).append("₽\n");

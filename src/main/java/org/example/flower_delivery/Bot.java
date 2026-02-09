@@ -24,6 +24,7 @@ import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.time.format.DateTimeFormatter;
 
 /**
  * Главный класс бота - это как "мозг" который слушает сообщения от Telegram
@@ -222,6 +223,12 @@ public class Bot extends TelegramLongPollingBot {
             
             sb.append("   💰 ").append(order.getDeliveryPrice()).append("₽\n");
             sb.append("   📊 Статус: ").append(order.getStatus().getDisplayName()).append("\n");
+
+            // Дата создания заказа (для понимания, когда заявка появилась)
+            if (order.getCreatedAt() != null) {
+                DateTimeFormatter fmt = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
+                sb.append("   📅 Создан: ").append(order.getCreatedAt().format(fmt)).append("\n");
+            }
             
             // Если есть курьер — показываем его телефон
             if (order.getCourier() != null) {
@@ -320,8 +327,9 @@ public class Bot extends TelegramLongPollingBot {
     
     /**
      * Показать меню магазина с кнопками (ReplyKeyboard — внизу экрана).
+     * Оставлен public, чтобы можно было вызывать из других хендлеров (например, /start).
      */
-    private void sendShopMenu(Long chatId, Shop shop, String headerText) {
+    public void sendShopMenu(Long chatId, Shop shop, String headerText) {
         // Создаём ряды с кнопками
         KeyboardRow row1 = new KeyboardRow();
         row1.add("📦 Создать заказ");

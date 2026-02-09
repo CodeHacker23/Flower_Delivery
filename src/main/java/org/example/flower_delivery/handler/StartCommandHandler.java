@@ -3,6 +3,8 @@ package org.example.flower_delivery.handler;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.example.flower_delivery.Bot;
+import org.example.flower_delivery.model.Shop;
+import org.example.flower_delivery.service.ShopService;
 import org.example.flower_delivery.service.UserService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
@@ -24,6 +26,7 @@ import java.util.List;
 public class StartCommandHandler {
     // Spring автоматически найдет UserService и подставит сюда (Dependency Injection)
     private final UserService userService;
+    private final ShopService shopService;
 
     // Spring автоматически найдет Bot и подставит сюда (Dependency Injection)
     // @Lazy - создаёт прокси для Bot, разрывая циклическую зависимость:
@@ -87,9 +90,36 @@ public class StartCommandHandler {
             sendWelcomeMessage(chatId, fullName, true);  // true = новый пользователь
 
         } catch (IllegalArgumentException e) {
-            // Пользователь уже зарегистрирован - не проблема, просто отправляем приветствие
+            // Пользователь уже зарегистрирован - не проблема, решаем что ему показать дальше
             log.debug("Пользователь уже зарегистрирован: telegramId={}", telegramId);
-            sendWelcomeMessage(chatId, fullName, false);  // false = существующий пользователь
+
+            // Проверяем, есть ли у пользователя магазин
+            var shopOptional = shopService.findByUserTelegramId(telegramId);
+            if (shopOptional.isPresent()) {
+                Shop shop = shopOptional.get();
+
+                if (Boolean.TRUE.equals(shop.getIsActive())) {
+                    // Активный магазин: сразу показываем главное меню магазина с Reply-клавиатурой
+                    bot.sendShopMenu(chatId, shop,
+                            String.format("Привет, %s! 👋\n\nВот меню твоего магазина:", fullName));
+                } else {
+                    // Магазин есть, но ждёт активации админом
+                    SendMessage msg = SendMessage.builder()
+                            .chatId(chatId.toString())
+                            .text("Привет, " + fullName + "! 👋\n\n" +
+                                    "Твой магазин уже зарегистрирован и ждёт активации администратором.\n" +
+                                    "После активации здесь появятся кнопки для создания и управления заказами.")
+                            .build();
+                    try {
+                        bot.execute(msg);
+                    } catch (TelegramApiException ex) {
+                        log.error("Ошибка при отправке сообщения об ожидании активации: chatId={}", chatId, ex);
+                    }
+                }
+            } else {
+                // Магазина ещё нет — старое поведение: выбрать роль
+                sendWelcomeMessage(chatId, fullName, false);  // false = существующий пользователь
+            }
 
         } catch (Exception e) {
             // Серьёзная ошибка - логируем и отправляем сообщение об ошибке
@@ -97,7 +127,7 @@ public class StartCommandHandler {
             sendErrorMessage(chatId);
         }
     }
-
+    // что то хз
     /**
      * Отправить приветственное сообщение с кнопками выбора роли
      *
