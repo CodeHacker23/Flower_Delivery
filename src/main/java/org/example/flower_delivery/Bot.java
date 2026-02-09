@@ -320,8 +320,9 @@ public class Bot extends TelegramLongPollingBot {
     
     /**
      * Показать меню магазина с кнопками (ReplyKeyboard — внизу экрана).
+     * Оставлен public, чтобы можно было вызывать из других хендлеров (например, /start).
      */
-    private void sendShopMenu(Long chatId, Shop shop, String headerText) {
+    public void sendShopMenu(Long chatId, Shop shop, String headerText) {
         // Создаём ряды с кнопками
         KeyboardRow row1 = new KeyboardRow();
         row1.add("📦 Создать заказ");
