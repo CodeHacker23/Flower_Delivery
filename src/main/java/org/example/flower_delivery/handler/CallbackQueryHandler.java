@@ -6,6 +6,7 @@ import org.example.flower_delivery.Bot;
 import org.example.flower_delivery.model.Role;
 import org.example.flower_delivery.model.Shop;
 import org.example.flower_delivery.service.ShopService;
+import org.example.flower_delivery.service.CourierService;
 import org.example.flower_delivery.service.UserService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
@@ -100,7 +101,10 @@ public class CallbackQueryHandler {
     // Сервис магазинов (для показа информации о магазине)
     private final ShopService shopService;
 
-    // Сервис заказов (для отмены и редактирования)
+    // Сервис курьеров (для назначения заказов)
+    private final CourierService courierService;
+
+    // Сервис заказов (для отмены, редактирования и работы курьера)
     private final org.example.flower_delivery.service.OrderService orderService;
 
     @Autowired
@@ -110,6 +114,11 @@ public class CallbackQueryHandler {
     @Autowired
     @Lazy
     private MyOrdersSelectionHandler myOrdersSelectionHandler;
+
+    // Обработчик регистрации курьера (после выбора роли "Курьер")
+    @Autowired
+    @Lazy
+    private CourierRegistrationHandler courierRegistrationHandler;
 
     /**
      * Обработать callback query (нажатие на кнопку)
@@ -198,6 +207,12 @@ public class CallbackQueryHandler {
                 answerCallbackQuery(callbackQuery.getId(), "🔎 Выбор заказа");
                 myOrdersSelectionHandler.startSelection(telegramId, chatId);
 
+            // ===== КУРЬЕР: ВЗЯТЬ ЗАКАЗ =====
+            } else if (callbackData.startsWith("courier_take_")) {
+                String orderIdStr = callbackData.replace("courier_take_", "");
+                answerCallbackQuery(callbackQuery.getId(), "✅ Берём заказ...");
+                handleCourierTakeOrder(telegramId, chatId, orderIdStr);
+
             } else {
                 log.warn("Неизвестный callback_data: {}", callbackData);
                 answerCallbackQuery(callbackQuery.getId(), "❌ Неизвестная команда");
@@ -238,16 +253,17 @@ public class CallbackQueryHandler {
 
             // Разная логика для разных ролей
             if (selectedRole == Role.SHOP) {
-                // Для магазина — сразу запускаем регистрацию
+                // Для магазина — сразу запускаем регистрацию магазина
                 sendMessage(chatId, "✅ Отлично! Ты выбрал роль: *Магазин*\n\n" +
                         "Теперь давай заполним информацию о твоём магазине.");
                 shopRegistrationHandler.startRegistrationFromCallback(telegramId, chatId);
             } else if (selectedRole == Role.COURIER) {
-                // Для курьера — пока просто сообщение (логику добавим позже)
-                sendMessage(chatId, "✅ Отлично! Ты выбрал роль: *Курьер*\n\n" +
-                        "Твоя роль сохранена в системе.\n" +
-                        "Скоро администратор активирует твой аккаунт.\n\n" +
-                        "Ожидай активации! ⏳");
+                // Для курьера — запускаем регистрацию курьера (запрос телефона)
+                sendMessage(chatId, "✅ Отлично! Ты выбрал роль: *Курьер*.\n\n" +
+                        "Сейчас зарегистрируем тебя как курьера.\n" +
+                        "Нажми кнопку ниже и поделись номером телефона.");
+
+                courierRegistrationHandler.startRegistrationFromCallback(telegramId, chatId, null);
             }
 
         } catch (IllegalArgumentException e) {
@@ -367,6 +383,53 @@ public class CallbackQueryHandler {
         } else {
             sendMessage(chatId, "❌ Не удалось отменить заказ.\nВозможно, он уже принят курьером или не найден.");
         }
+    }
+
+    /**
+     * Курьер нажал "Взять заказ" в списке доступных.
+     */
+    private void handleCourierTakeOrder(Long telegramId, Long chatId, String orderIdStr) {
+        java.util.UUID orderId;
+        try {
+            orderId = java.util.UUID.fromString(orderIdStr);
+        } catch (IllegalArgumentException e) {
+            sendMessage(chatId, "❌ Ошибка: неверный ID заказа.");
+            return;
+        }
+
+        var courierOpt = courierService.findByTelegramId(telegramId);
+        if (courierOpt.isEmpty()) {
+            sendMessage(chatId, "❌ У тебя нет активного профиля курьера.\n" +
+                    "Выбери роль *Курьер* через /start и пройди регистрацию.");
+            return;
+        }
+        var courier = courierOpt.get();
+        if (!Boolean.TRUE.equals(courier.getIsActive())) {
+            sendMessage(chatId, "⏳ Твой профиль курьера ещё не активирован.\n" +
+                    "Сначала активируй его командой /k (временно).");
+            return;
+        }
+
+        var assignResult = orderService.assignOrderToCourier(orderId, courier.getUser());
+        if (assignResult.isEmpty()) {
+            sendMessage(chatId, "❌ Не удалось взять этот заказ.\n" +
+                    "Возможно, его уже забрал другой курьер или он больше не доступен.");
+            return;
+        }
+
+        var order = assignResult.get();
+        StringBuilder sb = new StringBuilder();
+        sb.append("✅ *Заказ взят!*\n\n");
+        sb.append("📋 ID: ").append(order.getId().toString()).append("\n");
+        sb.append("📍 Адрес: ").append(order.getDeliveryAddress()).append("\n");
+        sb.append("👤 Получатель: ").append(order.getRecipientName())
+                .append(" (").append(order.getRecipientPhone()).append(")\n");
+        sb.append("💰 Оплата: ").append(order.getDeliveryPrice()).append("₽\n");
+        if (order.getDeliveryDate() != null) {
+            sb.append("📅 Дата доставки: ").append(order.getDeliveryDate()).append("\n");
+        }
+
+        sendMessage(chatId, sb.toString());
     }
 
     /**

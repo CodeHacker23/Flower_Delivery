@@ -3,6 +3,7 @@ package org.example.flower_delivery;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.example.flower_delivery.handler.CallbackQueryHandler;
+import org.example.flower_delivery.handler.CourierRegistrationHandler;
 import org.example.flower_delivery.handler.MyOrdersSelectionHandler;
 import org.example.flower_delivery.handler.OrderCreationHandler;
 import org.example.flower_delivery.handler.ShopRegistrationHandler;
@@ -60,6 +61,9 @@ public class Bot extends TelegramLongPollingBot {
     // Инжектируем обработчик регистрации магазина
     private final ShopRegistrationHandler shopRegistrationHandler;
     
+    // Инжектируем обработчик регистрации курьера
+    private final CourierRegistrationHandler courierRegistrationHandler;
+    
     // Инжектируем обработчик создания заказа
     private final OrderCreationHandler orderCreationHandler;
 
@@ -74,6 +78,9 @@ public class Bot extends TelegramLongPollingBot {
     
     // Инжектируем сервис заказов (для просмотра заказов)
     private final OrderService orderService;
+
+    // Инжектируем сервис курьеров (для временной активации командой /k)
+    private final org.example.flower_delivery.service.CourierService courierService;
     
     /**
      * Метод который вызывается КАЖДЫЙ РАЗ когда приходит новое сообщение/команда/кнопка
@@ -98,8 +105,20 @@ public class Bot extends TelegramLongPollingBot {
         
         // Проверяем, есть ли сообщение с контактом (кнопка "Поделиться номером")
         if (update.hasMessage() && update.getMessage().hasContact()) {
+            // Сначала пробуем отдать контакт регистрации магазина
             if (shopRegistrationHandler.handleContact(update)) {
-                return; // Контакт обработан
+                return; // Контакт обработан регистрацией магазина
+            }
+            // Если не магазин — пробуем как регистрацию курьера
+            if (courierRegistrationHandler.handleContact(update)) {
+                return; // Контакт обработан регистрацией курьера
+            }
+        }
+
+        // Проверяем, есть ли сообщение с фото (для селфи с паспортом курьера)
+        if (update.hasMessage() && update.getMessage().hasPhoto()) {
+            if (courierRegistrationHandler.handlePhoto(update)) {
+                return; // Фото обработано регистрацией курьера
             }
         }
         
@@ -109,6 +128,11 @@ public class Bot extends TelegramLongPollingBot {
             Long telegramId = update.getMessage().getFrom().getId();
             Long chatId = update.getMessage().getChatId();
             
+            // Если юзер в процессе регистрации курьера — обрабатываем его сообщение
+            if (courierRegistrationHandler.handleText(update)) {
+                return; // Сообщение обработано хендлером регистрации курьера
+            }
+
             // Если юзер в процессе регистрации магазина — обрабатываем его сообщение
             if (shopRegistrationHandler.handleMessage(update)) {
                 return; // Сообщение обработано хендлером регистрации
@@ -141,6 +165,10 @@ public class Bot extends TelegramLongPollingBot {
             else if (text.equals("/r")) {
                 handleActivateCommand(update);
             }
+            // ВРЕМЕННАЯ КОМАНДА: активировать своего курьера (для тестирования)
+            else if (text.equals("/k")) {
+                handleActivateCourierCommand(update);
+            }
             // Кнопка меню: Создать заказ
             else if (text.equals("📦 Создать заказ")) {
                 orderCreationHandler.startOrderCreation(telegramId, chatId);
@@ -149,9 +177,21 @@ public class Bot extends TelegramLongPollingBot {
             else if (text.equals("🏪 Мой магазин")) {
                 handleShopInfoButton(update);
             }
-            // Кнопка меню: Мои заказы
+            // Кнопка меню: Мои заказы (для магазина)
             else if (text.equals("📋 Мои заказы")) {
                 handleMyOrdersButton(update);
+            }
+            // Кнопка меню курьера: Доступные заказы (курьер)
+            else if (text.equals("📋 Доступные заказы")) {
+                handleCourierAvailableOrdersButton(update);
+            }
+            // Кнопка меню курьера: Мои заказы (курьер)
+            else if (text.equals("🚚 Мои заказы")) {
+                handleCourierMyOrdersButton(update);
+            }
+            // Кнопка меню курьера: Моя статистика (курьер)
+            else if (text.equals("💰 Моя статистика")) {
+                handleCourierStatsButton(update);
             }
             // Здесь позже добавим обработку других команд (/help, /orders и т.д.)
         }
@@ -324,6 +364,39 @@ public class Bot extends TelegramLongPollingBot {
         sendShopMenu(chatId, shop, "✅ *Магазин активирован!*\n\n" +
                 "Теперь ты можешь создавать заказы.");
     }
+
+    /**
+     * ВРЕМЕННАЯ КОМАНДА для тестирования.
+     * Активирует курьера для текущего пользователя.
+     *
+     * В продакшене это будет делать админ через админку.
+     */
+    private void handleActivateCourierCommand(Update update) {
+        Long telegramId = update.getMessage().getFrom().getId();
+        Long chatId = update.getMessage().getChatId();
+
+        var courierOptional = courierService.findByTelegramId(telegramId);
+
+        if (courierOptional.isEmpty()) {
+            sendSimpleMessage(chatId, "❌ У тебя ещё нет регистрации курьера.\n" +
+                    "Сначала выбери роль *Курьер* через /start.");
+            return;
+        }
+
+        var courier = courierOptional.get();
+
+        if (Boolean.TRUE.equals(courier.getIsActive())) {
+            // Профиль уже активен — просто показываем меню курьера
+            sendCourierMenu(chatId, "✅ Твой профиль курьера уже активирован.\n\n" +
+                    "Можешь смотреть доступные заказы и свою статистику.");
+            return;
+        }
+
+        courierService.activateCourier(courier);
+        // После активации сразу показываем меню курьера
+        sendCourierMenu(chatId, "✅ *Профиль курьера активирован!*\n\n" +
+                "Теперь ты можешь выбирать заказы и работать курьером.");
+    }
     
     /**
      * Показать меню магазина с кнопками (ReplyKeyboard — внизу экрана).
@@ -355,6 +428,145 @@ public class Bot extends TelegramLongPollingBot {
         } catch (TelegramApiException e) {
             log.error("Ошибка отправки меню магазина: chatId={}", chatId, e);
         }
+    }
+
+    /**
+     * Показать меню курьера с основными кнопками.
+     * Пока без сложной логики — просто точка входа для курьерского функционала.
+     */
+    public void sendCourierMenu(Long chatId, String headerText) {
+        // Один ряд с тремя кнопками
+        KeyboardRow row1 = new KeyboardRow();
+        row1.add("📋 Доступные заказы");
+        row1.add("🚚 Мои заказы");
+        row1.add("💰 Моя статистика");
+
+        ReplyKeyboardMarkup keyboard = new ReplyKeyboardMarkup();
+        keyboard.setKeyboard(List.of(row1));
+        keyboard.setResizeKeyboard(true);
+        keyboard.setOneTimeKeyboard(false);
+
+        try {
+            SendMessage message = SendMessage.builder()
+                    .chatId(chatId.toString())
+                    .text(headerText)
+                    .parseMode("Markdown")
+                    .replyMarkup(keyboard)
+                    .build();
+            execute(message);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки меню курьера: chatId={}", chatId, e);
+        }
+    }
+
+    /**
+     * Кнопка "📋 Доступные заказы" в меню курьера.
+     * Пока заглушка: позже сюда добавим выбор и сортировку по расстоянию.
+     */
+    private void handleCourierAvailableOrdersButton(Update update) {
+        Long telegramId = update.getMessage().getFrom().getId();
+        Long chatId = update.getMessage().getChatId();
+
+        // Проверяем, что у пользователя есть активный профиль курьера
+        var courierOpt = courierService.findByTelegramId(telegramId);
+        if (courierOpt.isEmpty()) {
+            sendSimpleMessage(chatId, "❌ У тебя ещё нет профиля курьера.\n\n" +
+                    "Выбери роль *Курьер* через /start и пройди регистрацию.");
+            return;
+        }
+        var courier = courierOpt.get();
+        if (!Boolean.TRUE.equals(courier.getIsActive())) {
+            sendSimpleMessage(chatId, "⏳ Твой профиль курьера ещё не активирован.\n\n" +
+                    "Сначала активируй его командой /k (временно),\n" +
+                    "позже это будет делать админ.");
+            return;
+        }
+
+        // (опционально) можно ограничить количество активных заказов для курьера
+        long activeCount = orderService.countActiveOrdersForCourier(courier.getUser());
+        int maxActive = 3;
+        if (activeCount >= maxActive) {
+            sendSimpleMessage(chatId, "🚫 У тебя уже " + activeCount + " активных заказов.\n\n" +
+                    "Сначала довези текущие (кнопка \"🚚 Мои заказы\"),\n" +
+                    "потом можно брать новые.");
+            return;
+        }
+
+        // Получаем все свободные заказы (NEW)
+        List<Order> availableOrders = orderService.getAvailableOrders();
+        if (availableOrders.isEmpty()) {
+            sendSimpleMessage(chatId, "📋 *Доступные заказы*\n\n" +
+                    "Сейчас нет свободных заказов.\n" +
+                    "Загляни сюда чуть позже.");
+            return;
+        }
+
+        // Ограничим список, чтобы не заваливать курьера (например, первыми 10)
+        int limit = Math.min(10, availableOrders.size());
+        List<Order> ordersToShow = availableOrders.subList(0, limit);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("📋 *Доступные заказы*\n\n");
+        sb.append("Показаны первые ").append(limit).append(" из ").append(availableOrders.size()).append(":\n\n");
+
+        List<List<InlineKeyboardButton>> keyboard = new ArrayList<>();
+
+        for (int i = 0; i < ordersToShow.size(); i++) {
+            Order order = ordersToShow.get(i);
+            int number = i + 1;
+
+            sb.append("*").append(number).append(". Заказ ").append(order.getId().toString().substring(0, 8)).append("*\n");
+            sb.append("   📍 ").append(order.getDeliveryAddress()).append("\n");
+            sb.append("   👤 ").append(order.getRecipientName()).append(" (").append(order.getRecipientPhone()).append(")\n");
+            sb.append("   💰 ").append(order.getDeliveryPrice()).append("₽\n");
+            if (order.getCreatedAt() != null) {
+                DateTimeFormatter fmt = DateTimeFormatter.ofPattern("dd.MM HH:mm");
+                sb.append("   📅 Создан: ").append(order.getCreatedAt().format(fmt)).append("\n");
+            }
+            sb.append("\n");
+
+            InlineKeyboardButton takeBtn = InlineKeyboardButton.builder()
+                    .text("✅ Взять заказ #" + number)
+                    .callbackData("courier_take_" + order.getId())
+                    .build();
+            keyboard.add(List.of(takeBtn));
+        }
+
+        InlineKeyboardMarkup markup = new InlineKeyboardMarkup(keyboard);
+
+        SendMessage message = new SendMessage();
+        message.setChatId(chatId.toString());
+        message.setText(sb.toString());
+        message.setParseMode("Markdown");
+        message.setReplyMarkup(markup);
+
+        try {
+            execute(message);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки списка доступных заказов курьеру: chatId={}", chatId, e);
+        }
+    }
+
+    /**
+     * Кнопка "🚚 Мои заказы" в меню курьера.
+     * Пока заглушка: позже покажем активные заказы, которые курьер сейчас везёт.
+     */
+    private void handleCourierMyOrdersButton(Update update) {
+        Long chatId = update.getMessage().getChatId();
+        sendSimpleMessage(chatId, "🚚 *Мои заказы (курьер)*\n\n" +
+                "Скоро здесь будет список заказов, которые ты уже взял.\n" +
+                "Пока это заглушка.");
+    }
+
+    /**
+     * Кнопка "💰 Моя статистика" в меню курьера.
+     * Пока заглушка: позже посчитаем заработок за период.
+     */
+    private void handleCourierStatsButton(Update update) {
+        Long chatId = update.getMessage().getChatId();
+        sendSimpleMessage(chatId, "💰 *Моя статистика*\n\n" +
+                "Здесь появится статистика по доставкам и заработку.\n" +
+                "Пока это заглушка.");
     }
     
     /**
