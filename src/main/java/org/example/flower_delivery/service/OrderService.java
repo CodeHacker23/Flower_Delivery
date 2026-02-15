@@ -9,17 +9,25 @@ import org.example.flower_delivery.model.OrderStatus;
 import org.example.flower_delivery.model.OrderStop;
 import org.example.flower_delivery.model.Shop;
 import org.example.flower_delivery.model.StopStatus;
+import org.example.flower_delivery.model.User;
 import org.example.flower_delivery.repository.OrderRepository;
 import org.example.flower_delivery.repository.OrderStopRepository;
+import org.example.flower_delivery.util.GeoUtil;
 
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @Service
 @Slf4j
@@ -105,6 +113,199 @@ public class OrderService {
      */
     public List<Order> getAvailableOrders() {
         return orderRepository.findByStatus(OrderStatus.NEW);
+    }
+
+    /**
+     * Доступные заказы с подгруженным магазином (для отображения адреса забора).
+     */
+    public List<Order> getAvailableOrdersWithShop() {
+        return orderRepository.findByStatusWithShop(OrderStatus.NEW);
+    }
+
+    /**
+     * Доступные заказы, отсортированные по расстоянию от курьера до магазина (ближайшие сверху).
+     * Заказы без координат магазина — в конце списка.
+     */
+    public List<Order> getAvailableOrdersSortedByDistanceFrom(double courierLat, double courierLon) {
+        List<Order> list = orderRepository.findByStatusWithShop(OrderStatus.NEW);
+        list.sort(Comparator.comparingDouble(order -> distanceFromCourier(order, courierLat, courierLon)));
+        return list;
+    }
+
+    private static double distanceFromCourier(Order order, double courierLat, double courierLon) {
+        if (order.getShop() == null || order.getShop().getLatitude() == null || order.getShop().getLongitude() == null) {
+            return Double.POSITIVE_INFINITY;
+        }
+        return GeoUtil.distanceKm(
+                courierLat, courierLon,
+                order.getShop().getLatitude().doubleValue(), order.getShop().getLongitude().doubleValue()
+        );
+    }
+
+    /**
+     * Сколько доставленных заказов от каждого магазина доставил курьер за последние lastHours часов.
+     * Нужно для честного распределения: показывать заказы от «обделённых» магазинов.
+     */
+    public Map<UUID, Long> getDeliveredCountPerShopForCourier(User courier, int lastHours) {
+        LocalDateTime since = LocalDateTime.now().minusHours(lastHours);
+        List<Order> delivered = orderRepository.findDeliveredByCourierSince(courier, OrderStatus.DELIVERED, since);
+        return delivered.stream()
+                .filter(o -> o.getShop() != null && o.getShop().getId() != null)
+                .collect(Collectors.groupingBy(o -> o.getShop().getId(), Collectors.counting()));
+    }
+
+    /**
+     * Доступные заказы с честным распределением: первые nearestCount — ближайшие по гео;
+     * следующие otherCount — от магазинов, которым этот курьер доставил меньше всего за последние 24 ч.
+     * Чтобы ни один магазин не был обделён.
+     */
+    public List<Order> getAvailableOrdersWithFairness(double courierLat, double courierLon, User courier, int nearestCount, int otherCount) {
+        List<Order> allSorted = getAvailableOrdersSortedByDistanceFrom(courierLat, courierLon);
+        if (allSorted.isEmpty()) return allSorted;
+
+        Map<UUID, Long> deliveredByShop = getDeliveredCountPerShopForCourier(courier, 24);
+        long minDeliveries = deliveredByShop.isEmpty() ? 0 : deliveredByShop.values().stream().min(Long::compareTo).orElse(0L);
+
+        int n = Math.min(nearestCount, allSorted.size());
+        List<Order> nearest = new ArrayList<>(allSorted.subList(0, n));
+        Set<UUID> nearestIds = nearest.stream().map(Order::getId).collect(Collectors.toSet());
+
+        List<Order> rest = allSorted.stream().filter(o -> !nearestIds.contains(o.getId())).toList();
+        List<Order> other = rest.stream()
+                .filter(o -> o.getShop() != null && o.getShop().getId() != null
+                        && deliveredByShop.getOrDefault(o.getShop().getId(), 0L) <= minDeliveries)
+                .limit(otherCount)
+                .toList();
+
+        List<Order> result = new ArrayList<>(nearest);
+        result.addAll(other);
+        return result;
+    }
+
+    /**
+     * Получить все заказы курьера.
+     */
+    public List<Order> getOrdersByCourier(User courier) {
+        return orderRepository.findByCourier(courier);
+    }
+
+    /**
+     * Заказы курьера с подгруженным магазином (для «Мои заказы» с адресом забора).
+     */
+    public List<Order> getOrdersByCourierWithShop(User courier) {
+        return orderRepository.findByCourierWithShop(courier);
+    }
+
+    /**
+     * Заказы курьера с подгруженными stops (для статистики: getTotalDeliveryPrice() у мультиадреса не падает с LazyInit).
+     */
+    public List<Order> getOrdersByCourierWithStops(User courier) {
+        return orderRepository.findByCourierWithStops(courier);
+    }
+
+    /**
+     * Заказ с подгруженным магазином (для сообщения «Заказ взят» и т.п.).
+     */
+    public Optional<Order> getOrderWithShop(UUID orderId) {
+        return orderRepository.findByIdWithShop(orderId);
+    }
+
+    /**
+     * Посчитать количество активных заказов курьера.
+     * Активные = в пути / в работе, ещё не завершённые.
+     */
+    public long countActiveOrdersForCourier(User courier) {
+        List<OrderStatus> activeStatuses = java.util.List.of(
+                OrderStatus.ACCEPTED,
+                OrderStatus.IN_SHOP,
+                OrderStatus.PICKED_UP,
+                OrderStatus.ON_WAY
+        );
+        return orderRepository.countByCourierAndStatusIn(courier, activeStatuses);
+    }
+
+    /**
+     * Попробовать назначить курьера на заказ.
+     *
+     * Условия:
+     * - заказ должен быть в статусе NEW;
+     * - у заказа ещё не должен быть назначен курьер.
+     *
+     * @return Optional с обновлённым заказом, либо empty если взять нельзя
+     */
+    @Transactional
+    public Optional<Order> assignOrderToCourier(UUID orderId, User courier) {
+        Optional<Order> opt = orderRepository.findById(orderId);
+        if (opt.isEmpty()) {
+            return Optional.empty();
+        }
+        Order order = opt.get();
+        if (!order.isAvailable() || order.hasCourier()) {
+            log.warn("Попытка взять недоступный заказ: orderId={}, status={}, hasCourier={}",
+                    orderId, order.getStatus(), order.hasCourier());
+            return Optional.empty();
+        }
+
+        order.setCourier(courier);
+        order.setStatus(OrderStatus.ACCEPTED);
+        order.setAcceptedAt(java.time.LocalDateTime.now());
+        Order saved = orderRepository.save(order);
+
+        log.info("Заказ {} назначен курьеру {} (userId={})",
+                saved.getId(), courier.getFullName(), courier.getId());
+
+        return Optional.of(saved);
+    }
+
+    /**
+     * Перевести заказ в следующий статус (только для заказа этого курьера).
+     * Цепочка: ACCEPTED → IN_SHOP → ON_WAY → DELIVERED (без отдельного «Забран»).
+     *
+     * @return true если статус обновлён, false если заказ не найден, не твой или переход недопустим
+     */
+    @Transactional
+    public boolean updateOrderStatusByCourier(UUID orderId, User courier, OrderStatus newStatus) {
+        Optional<Order> opt = orderRepository.findById(orderId);
+        if (opt.isEmpty()) return false;
+        Order order = opt.get();
+        if (order.getCourier() == null || !order.getCourier().getId().equals(courier.getId())) {
+            return false;
+        }
+        OrderStatus current = order.getStatus();
+        java.time.LocalDateTime now = java.time.LocalDateTime.now();
+        switch (current) {
+            case ACCEPTED:
+                if (newStatus != OrderStatus.IN_SHOP) return false;
+                if (order.getAcceptedAt() == null) order.setAcceptedAt(now);
+                break;
+            case IN_SHOP:
+                if (newStatus != OrderStatus.ON_WAY) return false;
+                order.setPickedUpAt(now);
+                break;
+            case PICKED_UP:
+                if (newStatus != OrderStatus.ON_WAY) return false;
+                break;
+            case ON_WAY:
+                if (newStatus != OrderStatus.DELIVERED) return false;
+                order.setDeliveredAt(now);
+                List<OrderStop> stops = orderStopRepository.findByOrderIdOrderByStopNumberAsc(orderId);
+                if (stops.isEmpty()) {
+                    order.setStatus(OrderStatus.DELIVERED);
+                    orderRepository.save(order);
+                } else {
+                    for (OrderStop s : stops) {
+                        markStopDelivered(orderId, s.getStopNumber());
+                    }
+                }
+                log.info("Заказ {} доставлен курьером {}", orderId, courier.getId());
+                return true;
+            default:
+                return false;
+        }
+        order.setStatus(newStatus);
+        orderRepository.save(order);
+        log.info("Заказ {} переведён в {} курьером {}", orderId, newStatus, courier.getId());
+        return true;
     }
 
     /**

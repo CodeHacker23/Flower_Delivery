@@ -10,6 +10,8 @@ import org.example.flower_delivery.repository.CourierRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.Optional;
 
 /**
@@ -84,5 +86,18 @@ import java.util.Optional;
         courier.setStatus(CourierStatus.BLOCKED);
         courier.setIsActive(false);
         return courierRepository.save(courier);
+    }
+
+    /**
+     * Обновить последнюю известную геолокацию курьера.
+     */
+    public void updateLastLocation(Long telegramId, double latitude, double longitude) {
+        findByTelegramId(telegramId).ifPresent(c -> {
+            c.setLastLatitude(BigDecimal.valueOf(latitude));
+            c.setLastLongitude(BigDecimal.valueOf(longitude));
+            c.setLastLocationAt(LocalDateTime.now());
+            courierRepository.save(c);
+            log.debug("Геолокация курьера обновлена: telegramId={}", telegramId);
+        });
     }
 }
