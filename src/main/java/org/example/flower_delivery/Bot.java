@@ -8,24 +8,33 @@ import org.example.flower_delivery.handler.MyOrdersSelectionHandler;
 import org.example.flower_delivery.handler.OrderCreationHandler;
 import org.example.flower_delivery.handler.ShopRegistrationHandler;
 import org.example.flower_delivery.handler.StartCommandHandler;
+import org.example.flower_delivery.handler.CourierAvailableOrdersHandler;
+import org.example.flower_delivery.model.Courier;
 import org.example.flower_delivery.model.Order;
+import org.example.flower_delivery.model.OrderStatus;
 import org.example.flower_delivery.model.Shop;
 import org.example.flower_delivery.service.OrderService;
 import org.example.flower_delivery.service.ShopService;
+import org.example.flower_delivery.util.GeoUtil;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardButton;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardRow;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.time.format.DateTimeFormatter;
+
+import static org.example.flower_delivery.model.OrderStatus.*;
 
 /**
  * Главный класс бота - это как "мозг" который слушает сообщения от Telegram
@@ -69,6 +78,12 @@ public class Bot extends TelegramLongPollingBot {
 
     // Обработчик выбора заказа из списка \"Мои заказы\"
     private final MyOrdersSelectionHandler myOrdersSelectionHandler;
+
+    // Обработчик выбора заказа курьером из списка доступных
+    private final CourierAvailableOrdersHandler courierAvailableOrdersHandler;
+
+    // Обработчик геолокации курьера (подтверждение «В магазине» / «Вручил» через локацию)
+    private final org.example.flower_delivery.handler.CourierGeoHandler courierGeoHandler;
 
     // Обработчик редактирования заказа (меню + ввод нового значения)
     private final org.example.flower_delivery.handler.OrderEditHandler orderEditHandler;
@@ -121,6 +136,27 @@ public class Bot extends TelegramLongPollingBot {
                 return; // Фото обработано регистрацией курьера
             }
         }
+
+        // Геолокация курьера: подтверждение «В магазине»/«Вручил» или просто обновление последней точки
+        if (update.hasMessage() && update.getMessage().hasLocation()) {
+            Long telegramId = update.getMessage().getFrom().getId();
+            Long chatId = update.getMessage().getChatId();
+            var location = update.getMessage().getLocation();
+            double lat = location.getLatitude();
+            double lon = location.getLongitude();
+            log.debug("Получена геолокация: telegramId={}, chatId={}", telegramId, chatId);
+            // Сначала проверяем: курьер ждал гео для списка «Доступные заказы»?
+            if (courierAvailableOrdersHandler.isAwaitingLocationForList(telegramId)) {
+                courierAvailableOrdersHandler.handleLocationForAvailableList(telegramId, chatId, lat, lon);
+                return;
+            }
+            if (courierGeoHandler.handleLocation(telegramId, chatId, lat, lon)) {
+                return; // Обработано как подтверждение статуса (снимок + смена статуса)
+            }
+            // Иначе — просто обновить последнюю известную точку курьера
+            courierService.updateLastLocation(telegramId, lat, lon);
+            return;
+        }
         
         // Проверяем, есть ли сообщение с текстом
         if (update.hasMessage() && update.getMessage().hasText()) {
@@ -150,9 +186,23 @@ public class Bot extends TelegramLongPollingBot {
                 }
             }
 
+            // Если курьер выбирает заказ из списка \"Доступные заказы\"
+            if (courierAvailableOrdersHandler.isAwaitingSelection(telegramId)) {
+                if (courierAvailableOrdersHandler.handleText(telegramId, chatId, text)) {
+                    return;
+                }
+            }
+
             // Если юзер в процессе редактирования заказа (ждёт ввод нового адреса/телефона/комментария)
             if (orderEditHandler.isEditing(telegramId)) {
                 if (orderEditHandler.handleText(telegramId, chatId, text)) {
+                    return;
+                }
+            }
+
+            // После подтверждения «В магазине» курьеру показывается кнопка «В путь» — обрабатываем нажатие
+            if (courierGeoHandler.isAwaitingOnWay(telegramId) && "🚗 В путь".equals(text)) {
+                if (courierGeoHandler.handleOnWayButton(telegramId, chatId)) {
                     return;
                 }
             }
@@ -262,17 +312,14 @@ public class Bot extends TelegramLongPollingBot {
             }
             
             sb.append("   💰 ").append(order.getDeliveryPrice()).append("₽\n");
-            sb.append("   📊 Статус: ").append(order.getStatus().getDisplayName()).append("\n");
+            // Название статуса жирным; «принят»/«в магазине» — 🚴, «доставлен» — ✅
+            String statusIcon = (order.getStatus() == ACCEPTED || order.getStatus() == IN_SHOP) ? " 🚴" : (order.getStatus() == DELIVERED ? " ✅" : "");
+            sb.append("   📊 Статус: *").append(order.getStatus().getDisplayName()).append("*").append(statusIcon).append("\n");
 
             // Дата создания заказа (для понимания, когда заявка появилась)
             if (order.getCreatedAt() != null) {
                 DateTimeFormatter fmt = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
                 sb.append("   📅 Создан: ").append(order.getCreatedAt().format(fmt)).append("\n");
-            }
-            
-            // Если есть курьер — показываем его телефон
-            if (order.getCourier() != null) {
-                sb.append("   🚴 Курьер: ").append(order.getCourier().getPhone()).append("\n");
             }
             
             sb.append("\n");
@@ -460,6 +507,30 @@ public class Bot extends TelegramLongPollingBot {
     }
 
     /**
+     * Отправить текст курьеру и вернуть меню (📋 Доступные заказы, 🚚 Мои заказы, 💰 Моя статистика).
+     * Без Markdown — для сообщений после геолокации, чтобы не ломаться на спецсимволах.
+     */
+    public void sendCourierMenuPlain(Long chatId, String text) {
+        KeyboardRow row1 = new KeyboardRow();
+        row1.add("📋 Доступные заказы");
+        row1.add("🚚 Мои заказы");
+        row1.add("💰 Моя статистика");
+        ReplyKeyboardMarkup keyboard = new ReplyKeyboardMarkup();
+        keyboard.setKeyboard(List.of(row1));
+        keyboard.setResizeKeyboard(true);
+        keyboard.setOneTimeKeyboard(false);
+        try {
+            execute(SendMessage.builder()
+                    .chatId(chatId.toString())
+                    .text(text)
+                    .replyMarkup(keyboard)
+                    .build());
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки меню курьера: chatId={}", chatId, e);
+        }
+    }
+
+    /**
      * Кнопка "📋 Доступные заказы" в меню курьера.
      * Пока заглушка: позже сюда добавим выбор и сортировку по расстоянию.
      */
@@ -492,8 +563,21 @@ public class Bot extends TelegramLongPollingBot {
             return;
         }
 
-        // Получаем все свободные заказы (NEW)
-        List<Order> availableOrders = orderService.getAvailableOrders();
+        // Есть ли «свежая» гео курьера (до 30 мин) — тогда показываем ближайшие заказы и маршруты
+        boolean hasFreshLocation = courier.getLastLocationAt() != null
+                && courier.getLastLocationAt().isAfter(LocalDateTime.now().minusMinutes(30))
+                && courier.getLastLatitude() != null && courier.getLastLongitude() != null;
+
+        List<Order> availableOrders;
+        if (hasFreshLocation) {
+            // Честное распределение: первые 5 — ближайшие, следующие 5 — от «других» магазинов (кому курьер мало отдавал за 24 ч)
+            availableOrders = orderService.getAvailableOrdersWithFairness(
+                    courier.getLastLatitude().doubleValue(), courier.getLastLongitude().doubleValue(),
+                    courier.getUser(), 5, 5);
+        } else {
+            availableOrders = orderService.getAvailableOrdersWithShop();
+        }
+
         if (availableOrders.isEmpty()) {
             sendSimpleMessage(chatId, "📋 *Доступные заказы*\n\n" +
                     "Сейчас нет свободных заказов.\n" +
@@ -501,50 +585,107 @@ public class Bot extends TelegramLongPollingBot {
             return;
         }
 
-        // Ограничим список, чтобы не заваливать курьера (например, первыми 10)
         int limit = Math.min(10, availableOrders.size());
         List<Order> ordersToShow = availableOrders.subList(0, limit);
 
+        if (hasFreshLocation) {
+            // Список с расстоянием и кнопками «Маршрут до магазина»
+            var content = buildAvailableOrdersContentWithLocation(ordersToShow,
+                    courier.getLastLatitude().doubleValue(), courier.getLastLongitude().doubleValue());
+            courierAvailableOrdersHandler.saveLastAvailableOrders(telegramId, ordersToShow);
+            SendMessage message = new SendMessage();
+            message.setChatId(chatId.toString());
+            message.setText(content.text());
+            message.setParseMode("Markdown");
+            message.setReplyMarkup(content.markup());
+            try {
+                execute(message);
+            } catch (TelegramApiException e) {
+                log.error("Ошибка отправки списка доступных заказов курьеру: chatId={}", chatId, e);
+            }
+            return;
+        }
+
+        // Гео нет или устарела — просим отправить локацию, чтобы показать ближайшие
+        courierAvailableOrdersHandler.startAwaitingLocationForList(telegramId);
+        sendLocationRequestForAvailableOrders(chatId);
+    }
+
+    /** Запрос геолокации для списка «Доступные заказы» (сортировка по расстоянию + маршруты). */
+    public void sendLocationRequestForAvailableOrders(Long chatId) {
+        KeyboardButton locationButton = new KeyboardButton("📍 Отправить геолокацию");
+        locationButton.setRequestLocation(true);
+        KeyboardRow row = new KeyboardRow();
+        row.add(locationButton);
+        ReplyKeyboardMarkup keyboard = new ReplyKeyboardMarkup();
+        keyboard.setKeyboard(List.of(row));
+        keyboard.setResizeKeyboard(true);
+        keyboard.setOneTimeKeyboard(true);
+        try {
+            execute(SendMessage.builder()
+                    .chatId(chatId.toString())
+                    .text("📍 Отправьте геолокацию, чтобы показать *ближайшие* заказы и построить маршрут до магазина.")
+                    .parseMode("Markdown")
+                    .replyMarkup(keyboard)
+                    .build());
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки запроса геолокации: chatId={}", chatId, e);
+        }
+    }
+
+    /** Текст и клавиатура списка «Доступные заказы» с расстоянием и кнопками «Маршрут до магазина» (Яндекс). */
+    public record AvailableOrdersContent(String text, InlineKeyboardMarkup markup) {}
+
+    public AvailableOrdersContent buildAvailableOrdersContentWithLocation(List<Order> ordersToShow, double courierLat, double courierLon) {
         StringBuilder sb = new StringBuilder();
-        sb.append("📋 *Доступные заказы*\n\n");
-        sb.append("Показаны первые ").append(limit).append(" из ").append(availableOrders.size()).append(":\n\n");
+        sb.append("📋 *Доступные заказы* (от ближайших)\n\n");
+        sb.append("Показаны ").append(ordersToShow.size()).append(" заказов:\n\n");
 
-        List<List<InlineKeyboardButton>> keyboard = new ArrayList<>();
-
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("dd.MM HH:mm");
         for (int i = 0; i < ordersToShow.size(); i++) {
             Order order = ordersToShow.get(i);
             int number = i + 1;
-
-            sb.append("*").append(number).append(". Заказ ").append(order.getId().toString().substring(0, 8)).append("*\n");
-            sb.append("   📍 ").append(order.getDeliveryAddress()).append("\n");
-            sb.append("   👤 ").append(order.getRecipientName()).append(" (").append(order.getRecipientPhone()).append(")\n");
+            sb.append("*").append(number).append(". Заказ*");
+            if (order.getShop() != null && order.getShop().getLatitude() != null && order.getShop().getLongitude() != null) {
+                double km = GeoUtil.distanceKm(courierLat, courierLon,
+                        order.getShop().getLatitude().doubleValue(), order.getShop().getLongitude().doubleValue());
+                sb.append(" — _").append(String.format("%.1f", km)).append(" км_");
+            }
+            sb.append("\n");
+            if (order.getShop() != null) {
+                String pickup = order.getShop().getPickupAddress() != null ? order.getShop().getPickupAddress() : "—";
+                sb.append("   🏪 Забрать: ").append(pickup).append("\n");
+            }
+            if (order.isMultiStopOrder()) {
+                List<org.example.flower_delivery.model.OrderStop> stops = orderService.getOrderStops(order.getId());
+                if (!stops.isEmpty()) {
+                    for (org.example.flower_delivery.model.OrderStop stop : stops) {
+                        sb.append("   📍 ").append(stop.getRecipientName()).append(" — ").append(stop.getDeliveryAddress()).append("\n");
+                    }
+                } else {
+                    sb.append("   📍 ").append(order.getDeliveryAddress()).append("\n");
+                    sb.append("   👤 ").append(order.getRecipientName()).append(" (").append(order.getRecipientPhone()).append(")\n");
+                }
+            } else {
+                sb.append("   📍 ").append(order.getDeliveryAddress()).append("\n");
+                sb.append("   👤 ").append(order.getRecipientName()).append(" (").append(order.getRecipientPhone()).append(")\n");
+            }
             sb.append("   💰 ").append(order.getDeliveryPrice()).append("₽\n");
             if (order.getCreatedAt() != null) {
-                DateTimeFormatter fmt = DateTimeFormatter.ofPattern("dd.MM HH:mm");
                 sb.append("   📅 Создан: ").append(order.getCreatedAt().format(fmt)).append("\n");
             }
             sb.append("\n");
-
-            InlineKeyboardButton takeBtn = InlineKeyboardButton.builder()
-                    .text("✅ Взять заказ #" + number)
-                    .callbackData("courier_take_" + order.getId())
-                    .build();
-            keyboard.add(List.of(takeBtn));
         }
 
-        InlineKeyboardMarkup markup = new InlineKeyboardMarkup(keyboard);
+        // Только кнопка «Выбрать заказ»; маршрут показываем после выбора заказа (в сообщении «Заказ взят!»)
+        List<List<InlineKeyboardButton>> keyboard = new ArrayList<>();
+        keyboard.add(List.of(InlineKeyboardButton.builder().text("🔎 Выбрать заказ").callbackData("courier_orders_select").build()));
+        return new AvailableOrdersContent(sb.toString(), new InlineKeyboardMarkup(keyboard));
+    }
 
-        SendMessage message = new SendMessage();
-        message.setChatId(chatId.toString());
-        message.setText(sb.toString());
-        message.setParseMode("Markdown");
-        message.setReplyMarkup(markup);
-
-        try {
-            execute(message);
-        } catch (TelegramApiException e) {
-            log.error("Ошибка отправки списка доступных заказов курьеру: chatId={}", chatId, e);
-        }
+    /** Ссылка на маршрут в Яндекс.Картах: от (lat1,lon1) до (lat2,lon2). */
+    private static String buildYandexRouteUrl(double fromLat, double fromLon, double toLat, double toLon) {
+        return "https://yandex.ru/maps/?rtext=" + fromLat + "," + fromLon + "~" + toLat + "," + toLon + "&rtt=auto";
     }
 
     /**
@@ -553,20 +694,217 @@ public class Bot extends TelegramLongPollingBot {
      */
     private void handleCourierMyOrdersButton(Update update) {
         Long chatId = update.getMessage().getChatId();
-        sendSimpleMessage(chatId, "🚚 *Мои заказы (курьер)*\n\n" +
-                "Скоро здесь будет список заказов, которые ты уже взял.\n" +
-                "Пока это заглушка.");
+        Long telegramId = update.getMessage().getFrom().getId();
+
+        var courierOpt = courierService.findByTelegramId(telegramId);
+
+        if(courierOpt.isEmpty()) {
+            sendSimpleMessage(chatId, "❌ У тебя ещё нет профиля курьера.\n\n" +
+                    "Выбери роль *Курьер* через /start и пройди регистрацию.");
+            return;
+        }
+
+        var courier = courierOpt.get();
+        if(!Boolean.TRUE.equals(courier.getIsActive())) {
+            sendSimpleMessage(chatId, "⏳ Твой профиль курьера ещё не активирован.\n\n" +
+                    "Сначала активируй его командой /k (временно),\n" +
+                    "позже это будет делать админ.");
+            return;
+        }
+
+        List<Order> allOrders = orderService.getOrdersByCourierWithShop(courier.getUser());
+        if (allOrders.isEmpty()) {
+            sendSimpleMessage(chatId, "🚚 *Мои заказы (курьер)*\n\n" +
+                    "У тебя пока нет заказов.\n" +
+                    "Зайди в «📋 Доступные заказы» и возьми первый заказ.");
+            return;
+        }
+
+        CourierMyOrdersContent content = buildCourierMyOrdersContent(courier, allOrders);
+        SendMessage message = new SendMessage();
+        message.setChatId(chatId.toString());
+        message.setText(content.text);
+        message.setParseMode("Markdown");
+        message.setReplyMarkup(content.replyMarkup);
+        try {
+            execute(message);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки списка заказов курьера: chatId={}", chatId, e);
+        }
     }
 
     /**
+     * Собрать текст и клавиатуру списка «Мои заказы» курьера (для отправки и для редактирования).
+     */
+    public CourierMyOrdersContent buildCourierMyOrdersContent(Courier courier, List<Order> allOrders) {
+        int max = 15;
+        int fromIndex = Math.max(0, allOrders.size() - max);
+        List<Order> orders = allOrders.subList(fromIndex, allOrders.size());
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("🚚 *Мои заказы (курьер)*\n\n");
+        sb.append("Всего: ").append(allOrders.size())
+                .append(", показаны последние ").append(orders.size()).append("\n\n");
+
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
+        for (int i = 0; i < orders.size(); i++) {
+            Order order = orders.get(i);
+            if (order.getShop() != null && order.getShop().getPickupAddress() != null) {
+                sb.append("*").append(i + 1).append(". ").append(order.getRecipientName()).append("*\n");
+                sb.append("   🏪 Забрать: ").append(order.getShop().getPickupAddress()).append("\n");
+            } else {
+                sb.append("*").append(i + 1).append(". ").append(order.getRecipientName()).append("*\n");
+            }
+            if (order.isMultiStopOrder()) {
+                List<org.example.flower_delivery.model.OrderStop> stops = orderService.getOrderStops(order.getId());
+                if (!stops.isEmpty()) {
+                    for (org.example.flower_delivery.model.OrderStop stop : stops) {
+                        String pointIcon = stop.isDelivered() ? "✅" : "📍";
+                        sb.append("   ").append(pointIcon).append(" Точка ").append(stop.getStopNumber())
+                                .append(": ").append(stop.getRecipientName()).append(" — ").append(stop.getDeliveryAddress()).append("\n");
+                    }
+                } else {
+                    sb.append("   📍 ").append(order.getDeliveryAddress()).append("\n");
+                }
+            } else {
+                sb.append("   📍 ").append(order.getDeliveryAddress()).append("\n");
+            }
+            sb.append("   💰 ").append(order.getDeliveryPrice()).append("₽\n");
+            String statusIcon;
+            switch (order.getStatus()) {
+                case ACCEPTED, IN_SHOP, PICKED_UP, ON_WAY -> statusIcon = "🔥";
+                case DELIVERED -> statusIcon = "✅";
+                case RETURNED -> statusIcon = "↩️";
+                case CANCELLED -> statusIcon = "⛔";
+                case NEW -> statusIcon = "🆕";
+                default -> statusIcon = "ℹ️";
+            }
+            sb.append("   📊 Статус: *").append(order.getStatus().getDisplayName()).append("* ").append(statusIcon).append("\n");
+            if (order.getCreatedAt() != null) {
+                sb.append("   📅 Создан: ").append(order.getCreatedAt().format(fmt)).append("\n");
+            }
+            sb.append("\n");
+        }
+
+        List<InlineKeyboardButton> statusRow = new ArrayList<>();
+        for (int i = 0; i < orders.size(); i++) {
+            Order order = orders.get(i);
+            OrderStatus next = nextStatusForCourier(order.getStatus());
+            if (next == null) continue;
+            // Вариант B: мультиадрес в пути — кнопки «Доставлено в точку 1», «Доставлено в точку 2» …
+            if (next == DELIVERED && order.isMultiStopOrder()) {
+                List<org.example.flower_delivery.model.OrderStop> stops = orderService.getOrderStops(order.getId());
+                for (org.example.flower_delivery.model.OrderStop stop : stops) {
+                    if (!stop.isDelivered()) {
+                        InlineKeyboardButton btn = new InlineKeyboardButton();
+                        btn.setText((i + 1) + ". Точка " + stop.getStopNumber() + " → Вручил");
+                        btn.setCallbackData("courier_stop_delivered:" + order.getId() + ":" + stop.getStopNumber());
+                        statusRow.add(btn);
+                    }
+                }
+            } else {
+                InlineKeyboardButton btn = new InlineKeyboardButton();
+                btn.setText((i + 1) + " → " + next.getDisplayName());
+                btn.setCallbackData("courier_order_next:" + order.getId());
+                statusRow.add(btn);
+            }
+        }
+        InlineKeyboardMarkup markup = new InlineKeyboardMarkup();
+        List<List<InlineKeyboardButton>> rows = new ArrayList<>();
+        for (int r = 0; r < statusRow.size(); r += 4) {
+            rows.add(statusRow.subList(r, Math.min(r + 4, statusRow.size())));
+        }
+        markup.setKeyboard(rows);
+        return new CourierMyOrdersContent(sb.toString(), markup);
+    }
+
+    /** Редактировать сообщение «Мои заказы» курьера (обновить список и кнопки). */
+    public void editCourierMyOrdersMessage(Long chatId, Integer messageId, Long telegramId) {
+        var courierOpt = courierService.findByTelegramId(telegramId);
+        if (courierOpt.isEmpty()) return;
+        List<Order> allOrders = orderService.getOrdersByCourierWithShop(courierOpt.get().getUser());
+        if (allOrders.isEmpty()) return;
+        CourierMyOrdersContent content = buildCourierMyOrdersContent(courierOpt.get(), allOrders);
+        EditMessageText edit = new EditMessageText();
+        edit.setChatId(chatId.toString());
+        edit.setMessageId(messageId);
+        edit.setText(content.text);
+        edit.setParseMode("Markdown");
+        edit.setReplyMarkup(content.replyMarkup);
+        try {
+            execute(edit);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка редактирования списка заказов курьера: chatId={}, messageId={}", chatId, messageId, e);
+        }
+    }
+
+    private static class CourierMyOrdersContent {
+        final String text;
+        final InlineKeyboardMarkup replyMarkup;
+        CourierMyOrdersContent(String text, InlineKeyboardMarkup replyMarkup) {
+            this.text = text;
+            this.replyMarkup = replyMarkup;
+        }
+    }
+
+    /** Следующий статус в цепочке курьера: В магазине → В пути → Доставлен (без «Забран»). */
+    private static OrderStatus nextStatusForCourier(OrderStatus current) {
+        return switch (current) {
+            case ACCEPTED -> IN_SHOP;
+            case IN_SHOP -> ON_WAY;
+            case PICKED_UP -> ON_WAY;
+            case ON_WAY -> DELIVERED;
+            default -> null;
+        };
+    }
+
+    
+
+    /**
      * Кнопка "💰 Моя статистика" в меню курьера.
-     * Пока заглушка: позже посчитаем заработок за период.
+     * Показывает количество доставленных заказов и сумму заработка (всего и за текущий месяц).
      */
     private void handleCourierStatsButton(Update update) {
         Long chatId = update.getMessage().getChatId();
-        sendSimpleMessage(chatId, "💰 *Моя статистика*\n\n" +
-                "Здесь появится статистика по доставкам и заработку.\n" +
-                "Пока это заглушка.");
+        Long telegramId = update.getMessage().getFrom().getId();
+
+        var courierOpt = courierService.findByTelegramId(telegramId);
+        if (courierOpt.isEmpty()) {
+            sendSimpleMessage(chatId, "❌ У тебя ещё нет профиля курьера.\n\nВыбери роль *Курьер* через /start и пройди регистрацию.");
+            return;
+        }
+        if (!Boolean.TRUE.equals(courierOpt.get().getIsActive())) {
+            sendSimpleMessage(chatId, "⏳ Твой профиль курьера ещё не активирован.\n\nСначала активируй его командой /k.");
+            return;
+        }
+
+        // С подгруженными stops, чтобы getTotalDeliveryPrice() не падал с LazyInit у мультиадреса
+        List<Order> allOrders = orderService.getOrdersByCourierWithStops(courierOpt.get().getUser());
+        java.time.LocalDate now = java.time.LocalDate.now();
+        java.time.YearMonth thisMonth = java.time.YearMonth.from(now);
+
+        long totalDelivered = allOrders.stream().filter(o -> o.getStatus() == DELIVERED).count();
+        java.math.BigDecimal totalSum = allOrders.stream()
+                .filter(o -> o.getStatus() == DELIVERED)
+                .map(Order::getTotalDeliveryPrice)
+                .reduce(java.math.BigDecimal.ZERO, java.math.BigDecimal::add);
+
+        long monthDelivered = allOrders.stream()
+                .filter(o -> o.getStatus() == DELIVERED && o.getDeliveredAt() != null
+                        && java.time.YearMonth.from(o.getDeliveredAt()).equals(thisMonth))
+                .count();
+        java.math.BigDecimal monthSum = allOrders.stream()
+                .filter(o -> o.getStatus() == DELIVERED && o.getDeliveredAt() != null
+                        && java.time.YearMonth.from(o.getDeliveredAt()).equals(thisMonth))
+                .map(Order::getTotalDeliveryPrice)
+                .reduce(java.math.BigDecimal.ZERO, java.math.BigDecimal::add);
+
+        String monthName = thisMonth.getMonth().getDisplayName(java.time.format.TextStyle.FULL, new java.util.Locale("ru"));
+        String text = "💰 *Моя статистика*\n\n" +
+                "📦 *Всего доставлено:* " + totalDelivered + " заказов\n" +
+                "💵 *Сумма:* " + totalSum + " ₽\n\n" +
+                "📅 *За " + monthName + ":* " + monthDelivered + " заказов, " + monthSum + " ₽";
+        sendSimpleMessage(chatId, text);
     }
     
     /**

@@ -3,6 +3,7 @@ package org.example.flower_delivery.handler;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.example.flower_delivery.Bot;
+import org.example.flower_delivery.model.OrderStatus;
 import org.example.flower_delivery.model.Role;
 import org.example.flower_delivery.model.Shop;
 import org.example.flower_delivery.service.ShopService;
@@ -21,6 +22,8 @@ import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
 import java.util.List;
 import java.util.UUID;
+
+import org.example.flower_delivery.model.OrderStop;
 
 /**
  * Обработчик callback query - это когда пользователь нажимает на Inline кнопку
@@ -104,6 +107,11 @@ public class CallbackQueryHandler {
     // Сервис курьеров (для назначения заказов)
     private final CourierService courierService;
 
+    // Обработчик выбора доступных заказов курьером
+    @Autowired
+    @Lazy
+    private CourierAvailableOrdersHandler courierAvailableOrdersHandler;
+
     // Сервис заказов (для отмены, редактирования и работы курьера)
     private final org.example.flower_delivery.service.OrderService orderService;
 
@@ -120,6 +128,10 @@ public class CallbackQueryHandler {
     @Lazy
     private CourierRegistrationHandler courierRegistrationHandler;
 
+    @Autowired
+    @Lazy
+    private CourierGeoHandler courierGeoHandler;
+
     /**
      * Обработать callback query (нажатие на кнопку)
      *
@@ -133,9 +145,17 @@ public class CallbackQueryHandler {
         }
 
         CallbackQuery callbackQuery = update.getCallbackQuery();
-        String callbackData = callbackQuery.getData();  // Данные кнопки (например "role_shop")
-        Long telegramId = callbackQuery.getFrom().getId();  // ID пользователя, который нажал
-        Long chatId = callbackQuery.getMessage().getChatId();  // ID чата
+        if (callbackQuery.getMessage() == null) {
+            answerCallbackQuery(callbackQuery.getId(), "❌ Сообщение недоступно");
+            return;
+        }
+        String callbackData = callbackQuery.getData();
+        if (callbackData == null || callbackData.isEmpty()) {
+            answerCallbackQuery(callbackQuery.getId(), "❌ Пустая команда");
+            return;
+        }
+        Long telegramId = callbackQuery.getFrom().getId();
+        Long chatId = callbackQuery.getMessage().getChatId();
 
         log.info("Обработка callback query: telegramId={}, callbackData={}", telegramId, callbackData);
 
@@ -207,12 +227,20 @@ public class CallbackQueryHandler {
                 answerCallbackQuery(callbackQuery.getId(), "🔎 Выбор заказа");
                 myOrdersSelectionHandler.startSelection(telegramId, chatId);
 
-            // ===== КУРЬЕР: ВЗЯТЬ ЗАКАЗ =====
-            } else if (callbackData.startsWith("courier_take_")) {
-                String orderIdStr = callbackData.replace("courier_take_", "");
-                answerCallbackQuery(callbackQuery.getId(), "✅ Берём заказ...");
-                handleCourierTakeOrder(telegramId, chatId, orderIdStr);
+            // ===== КУРЬЕР: ВЫБРАТЬ ЗАКАЗ ИЗ СПИСКА =====
+            } else if (callbackData.equals("courier_orders_select")) {
+                answerCallbackQuery(callbackQuery.getId(), "🔎 Выбор заказа");
+                courierAvailableOrdersHandler.startSelection(telegramId, chatId);
 
+            // ===== КУРЬЕР: СМЕНА СТАТУСА ЗАКАЗА =====
+            } else if (callbackData.startsWith("courier_order_next:")) {
+                String orderIdStr = callbackData.replace("courier_order_next:", "");
+                Integer listMessageId = callbackQuery.getMessage().getMessageId();
+                handleCourierOrderNextStatus(telegramId, chatId, callbackQuery.getId(), orderIdStr, listMessageId);
+            } else if (callbackData.startsWith("courier_stop_delivered:")) {
+                String rest = callbackData.replace("courier_stop_delivered:", "");
+                Integer listMessageId = callbackQuery.getMessage().getMessageId();
+                handleCourierStopDelivered(telegramId, chatId, callbackQuery.getId(), rest, listMessageId);
             } else {
                 log.warn("Неизвестный callback_data: {}", callbackData);
                 answerCallbackQuery(callbackQuery.getId(), "❌ Неизвестная команда");
@@ -386,50 +414,103 @@ public class CallbackQueryHandler {
     }
 
     /**
-     * Курьер нажал "Взять заказ" в списке доступных.
+     * Курьер нажал «следующий статус» у заказа — переводим заказ в следующий статус.
+     * listMessageId — message_id сообщения «Мои заказы», чтобы отредактировать его вместо нового сообщения.
      */
-    private void handleCourierTakeOrder(Long telegramId, Long chatId, String orderIdStr) {
-        java.util.UUID orderId;
+    private void handleCourierOrderNextStatus(Long telegramId, Long chatId, String callbackQueryId, String orderIdStr, Integer listMessageId) {
+        UUID orderId;
         try {
-            orderId = java.util.UUID.fromString(orderIdStr);
+            orderId = UUID.fromString(orderIdStr);
         } catch (IllegalArgumentException e) {
-            sendMessage(chatId, "❌ Ошибка: неверный ID заказа.");
+            answerCallbackQuery(callbackQueryId, "❌ Неверный ID заказа");
             return;
         }
-
         var courierOpt = courierService.findByTelegramId(telegramId);
-        if (courierOpt.isEmpty()) {
-            sendMessage(chatId, "❌ У тебя нет активного профиля курьера.\n" +
-                    "Выбери роль *Курьер* через /start и пройди регистрацию.");
+        if (courierOpt.isEmpty() || !Boolean.TRUE.equals(courierOpt.get().getIsActive())) {
+            answerCallbackQuery(callbackQueryId, "❌ Нет активного профиля курьера");
             return;
         }
-        var courier = courierOpt.get();
-        if (!Boolean.TRUE.equals(courier.getIsActive())) {
-            sendMessage(chatId, "⏳ Твой профиль курьера ещё не активирован.\n" +
-                    "Сначала активируй его командой /k (временно).");
+        var orderOpt = orderService.findById(orderId);
+        if (orderOpt.isEmpty()) {
+            answerCallbackQuery(callbackQueryId, "❌ Заказ не найден");
             return;
         }
-
-        var assignResult = orderService.assignOrderToCourier(orderId, courier.getUser());
-        if (assignResult.isEmpty()) {
-            sendMessage(chatId, "❌ Не удалось взять этот заказ.\n" +
-                    "Возможно, его уже забрал другой курьер или он больше не доступен.");
+        OrderStatus current = orderOpt.get().getStatus();
+        OrderStatus next = nextStatusForCourier(current);
+        if (next == null) {
+            answerCallbackQuery(callbackQueryId, "❌ Для этого заказа смена статуса недоступна");
             return;
         }
-
-        var order = assignResult.get();
-        StringBuilder sb = new StringBuilder();
-        sb.append("✅ *Заказ взят!*\n\n");
-        sb.append("📋 ID: ").append(order.getId().toString()).append("\n");
-        sb.append("📍 Адрес: ").append(order.getDeliveryAddress()).append("\n");
-        sb.append("👤 Получатель: ").append(order.getRecipientName())
-                .append(" (").append(order.getRecipientPhone()).append(")\n");
-        sb.append("💰 Оплата: ").append(order.getDeliveryPrice()).append("₽\n");
-        if (order.getDeliveryDate() != null) {
-            sb.append("📅 Дата доставки: ").append(order.getDeliveryDate()).append("\n");
+        // «В магазине» и «Вручил» — подтверждаем через геолокацию (2 в 1)
+        if (next == OrderStatus.IN_SHOP || next == OrderStatus.DELIVERED) {
+            answerCallbackQuery(callbackQueryId, "📍 Отправьте геолокацию");
+            courierGeoHandler.requestLocationForStatus(telegramId, chatId, orderId, next, listMessageId);
+            return;
         }
+        boolean updated = orderService.updateOrderStatusByCourier(orderId, courierOpt.get().getUser(), next);
+        if (updated) {
+            answerCallbackQuery(callbackQueryId, "✅ " + next.getDisplayName());
+            bot.editCourierMyOrdersMessage(chatId, listMessageId, telegramId);
+        } else {
+            answerCallbackQuery(callbackQueryId, "❌ Не удалось обновить статус");
+        }
+    }
 
-        sendMessage(chatId, sb.toString());
+    /**
+     * Курьер нажал «Доставлено в точку N» (вариант B — поточное подтверждение мультиадреса).
+     * Запрашиваем геолокацию, после неё в CourierGeoHandler вызывается markStopDelivered.
+     */
+    private void handleCourierStopDelivered(Long telegramId, Long chatId, String callbackQueryId, String rest, Integer listMessageId) {
+        String[] parts = rest.split(":", 2);
+        if (parts.length != 2) {
+            answerCallbackQuery(callbackQueryId, "❌ Ошибка данных");
+            return;
+        }
+        UUID orderId;
+        try {
+            orderId = UUID.fromString(parts[0]);
+        } catch (IllegalArgumentException e) {
+            answerCallbackQuery(callbackQueryId, "❌ Неверный ID заказа");
+            return;
+        }
+        int stopNumber;
+        try {
+            stopNumber = Integer.parseInt(parts[1]);
+        } catch (NumberFormatException e) {
+            answerCallbackQuery(callbackQueryId, "❌ Неверный номер точки");
+            return;
+        }
+        var courierOpt = courierService.findByTelegramId(telegramId);
+        if (courierOpt.isEmpty() || !Boolean.TRUE.equals(courierOpt.get().getIsActive())) {
+            answerCallbackQuery(callbackQueryId, "❌ Нет активного профиля курьера");
+            return;
+        }
+        var orderOpt = orderService.findById(orderId);
+        if (orderOpt.isEmpty() || orderOpt.get().getStatus() != OrderStatus.ON_WAY) {
+            answerCallbackQuery(callbackQueryId, "❌ Заказ не найден или не в пути");
+            return;
+        }
+        List<OrderStop> stops = orderService.getOrderStops(orderId);
+        OrderStop targetStop = stops.stream()
+                .filter(s -> s.getStopNumber() != null && s.getStopNumber() == stopNumber)
+                .findFirst()
+                .orElse(null);
+        if (targetStop == null || targetStop.isDelivered()) {
+            answerCallbackQuery(callbackQueryId, "❌ Точка уже доставлена или не найдена");
+            return;
+        }
+        answerCallbackQuery(callbackQueryId, "📍 Отправьте геолокацию");
+        courierGeoHandler.requestLocationForStopDelivery(telegramId, chatId, orderId, stopNumber, listMessageId);
+    }
+
+    private static OrderStatus nextStatusForCourier(OrderStatus current) {
+        return switch (current) {
+            case ACCEPTED -> OrderStatus.IN_SHOP;
+            case IN_SHOP -> OrderStatus.ON_WAY;
+            case PICKED_UP -> OrderStatus.ON_WAY;
+            case ON_WAY -> OrderStatus.DELIVERED;
+            default -> null;
+        };
     }
 
     /**
