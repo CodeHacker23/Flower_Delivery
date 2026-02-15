@@ -6,6 +6,7 @@ import lombok.*;
 import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.UpdateTimestamp;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -103,6 +104,25 @@ public class Courier {
     @UpdateTimestamp
     @Column(name = "updated_at", nullable = false)
     private LocalDateTime updatedAt;
+
+    /**
+     * Последняя известная широта курьера (геолокация из Telegram).
+     * NULL — курьер ещё не отправлял локацию.
+     */
+    @Column(name = "last_latitude", precision = 10, scale = 8)
+    private BigDecimal lastLatitude;
+
+    /**
+     * Последняя известная долгота курьера.
+     */
+    @Column(name = "last_longitude", precision = 11, scale = 8)
+    private BigDecimal lastLongitude;
+
+    /**
+     * Когда курьер последний раз отправлял геолокацию.
+     */
+    @Column(name = "last_location_at")
+    private LocalDateTime lastLocationAt;
 
     // Здесь потом можно докинуть:
     // - тип транспорта (пеший, авто, вело),
