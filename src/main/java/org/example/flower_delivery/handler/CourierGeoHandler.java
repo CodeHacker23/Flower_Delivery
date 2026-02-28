@@ -8,6 +8,7 @@ import org.example.flower_delivery.model.Order;
 import org.example.flower_delivery.model.OrderStatus;
 import org.example.flower_delivery.model.OrderStop;
 import org.example.flower_delivery.util.GeoUtil;
+import org.example.flower_delivery.repository.OrderStopRepository;
 import org.example.flower_delivery.service.CourierGeoService;
 import org.example.flower_delivery.service.CourierService;
 import org.example.flower_delivery.service.OrderService;
@@ -39,6 +40,7 @@ public class CourierGeoHandler {
     private final CourierService courierService;
     private final CourierGeoService courierGeoService;
     private final OrderService orderService;
+    private final OrderStopRepository orderStopRepository;
 
     @Autowired
     @Lazy
@@ -169,12 +171,11 @@ public class CourierGeoHandler {
             }
             try {
                 courierService.updateLastLocation(telegramId, latitude, longitude);
-                // TODO: включить после полевых тестов — проверка 200 м + 3 попытки и вызов админа.
+                // TODO: раскомментировать после тестов — проверка 200 м при подтверждении «В магазине» / «Вручил»
                 // double[] ref = getReferenceCoordinatesForPending(pending);
                 // if (ref != null && !GeoUtil.isWithinRadiusKm(latitude, longitude, ref[0], ref[1], GeoUtil.RADIUS_200_M_KM)) {
                 //     int newAttempts = pending.attempts + 1;
                 //     if (newAttempts >= 3) {
-                //         // 3-я неудачная попытка — зовём админа и не даём больше подтверждать автоматически.
                 //         log.warn("Курьер не смог подтвердить гео за 3 попытки: telegramId={}, orderId={}, status={}",
                 //                 telegramId, pending.orderId, pending.nextStatus);
                 //         bot.notifyAdminsAboutCourierGeoIssue(telegramId, pending.orderId, pending.nextStatus, latitude, longitude, newAttempts);
@@ -183,7 +184,6 @@ public class CourierGeoHandler {
                 //                         "Я позвал администратора, он посмотрит ситуацию и свяжется при необходимости.\n\n" +
                 //                         "Меню курьера ниже.");
                 //     } else {
-                //         // Сохраняем ожидание гео с увеличенным счётчиком попыток.
                 //         awaitingLocation.put(telegramId, pending.withAttempts(newAttempts));
                 //         sendMessageWithLocationKeyboard(chatId,
                 //                 "❌ Вы слишком далеко от точки (нужно быть в радиусе 200 м).\n" +
@@ -191,7 +191,7 @@ public class CourierGeoHandler {
                 //     }
                 //     return true;
                 // }
-                // Вариант B: доставка по точке мультиадреса (подтверждаем только эту точку)
+                // Доставка по точке мультиадреса (подтверждаем только эту точку)
                 if (pending.stopNumber != null) {
                     courierGeoService.saveSnapshot(pending.orderId, OrderStatus.DELIVERED, latitude, longitude);
                     orderService.markStopDelivered(pending.orderId, pending.stopNumber);
@@ -234,39 +234,41 @@ public class CourierGeoHandler {
         return true;
     }
 
-    // TODO: включить вместе с проверкой радиуса 200 м для «В магазине» / «Вручил».
-    // Оставляем метод закомментированным, чтобы не забыть логику.
-    //
-    // /**
-    //  * Координаты точки, от которой проверяем радиус 200 м:
-    //  * IN_SHOP — магазин (адрес забора), DELIVERED — адрес доставки (заказа или точки мультиадреса).
-    //  * Возвращает null, если координаты не заданы (проверку не делаем).
-    //  */
-    // private double[] getReferenceCoordinatesForPending(PendingGeoConfirmation pending) {
-    //     if (pending.nextStatus == OrderStatus.IN_SHOP) {
-    //         return orderService.getOrderWithShop(pending.orderId)
-    //                 .filter(o -> o.getShop() != null && o.getShop().getLatitude() != null && o.getShop().getLongitude() != null)
-    //                 .map(o -> new double[]{o.getShop().getLatitude().doubleValue(), o.getShop().getLongitude().doubleValue()})
-    //                 .orElse(null);
-    //     }
-    //     if (pending.nextStatus == OrderStatus.DELIVERED) {
-    //         Optional<Order> orderOpt = orderService.findById(pending.orderId);
-    //         if (orderOpt.isEmpty()) return null;
-    //         Order order = orderOpt.get();
-    //         if (pending.stopNumber != null) {
-    //             return order.getStops().stream()
-    //                     .filter(s -> pending.stopNumber.equals(s.getStopNumber()))
-    //                     .findFirst()
-    //                     .filter(OrderStop::hasCoordinates)
-    //                     .map(s -> new double[]{s.getDeliveryLatitude().doubleValue(), s.getDeliveryLongitude().doubleValue()})
-    //                     .orElse(null);
-    //         }
-    //         if (order.getDeliveryLatitude() != null && order.getDeliveryLongitude() != null) {
-    //             return new double[]{order.getDeliveryLatitude().doubleValue(), order.getDeliveryLongitude().doubleValue()};
-    //         }
-    //     }
-    //     return null;
-    // }
+    /**
+     * Координаты точки, от которой проверяем радиус 200 м:
+     * IN_SHOP — магазин (адрес забора), DELIVERED — адрес доставки (заказа или точки мультиадреса).
+     * Возвращает null, если координаты не заданы (проверку пропускаем).
+     */
+    private double[] getReferenceCoordinatesForPending(PendingGeoConfirmation pending) {
+        if (pending.nextStatus == OrderStatus.IN_SHOP) {
+            return orderService.getOrderWithShop(pending.orderId)
+                    .filter(o -> o.getShop() != null && o.getShop().getLatitude() != null && o.getShop().getLongitude() != null)
+                    .map(o -> new double[]{o.getShop().getLatitude().doubleValue(), o.getShop().getLongitude().doubleValue()})
+                    .orElse(null);
+        }
+        if (pending.nextStatus == OrderStatus.DELIVERED) {
+            if (pending.stopNumber != null) {
+                return orderStopRepository.findByOrderIdAndStopNumber(pending.orderId, pending.stopNumber)
+                        .filter(OrderStop::hasCoordinates)
+                        .map(s -> new double[]{s.getDeliveryLatitude().doubleValue(), s.getDeliveryLongitude().doubleValue()})
+                        .orElse(null);
+            }
+            Optional<Order> orderOpt = orderService.getOrderWithShop(pending.orderId);
+            if (orderOpt.isEmpty()) return null;
+            Order order = orderOpt.get();
+            if (order.getDeliveryLatitude() != null && order.getDeliveryLongitude() != null) {
+                return new double[]{order.getDeliveryLatitude().doubleValue(), order.getDeliveryLongitude().doubleValue()};
+            }
+            var stops = orderStopRepository.findByOrderIdOrderByStopNumberAsc(pending.orderId);
+            if (!stops.isEmpty()) {
+                var lastStop = stops.get(stops.size() - 1);
+                if (lastStop.hasCoordinates()) {
+                    return new double[]{lastStop.getDeliveryLatitude().doubleValue(), lastStop.getDeliveryLongitude().doubleValue()};
+                }
+            }
+        }
+        return null;
+    }
 
     private void sendMessageWithLocationKeyboard(Long chatId, String text) {
         KeyboardButton locationButton = new KeyboardButton("📍 Отправить геолокацию");

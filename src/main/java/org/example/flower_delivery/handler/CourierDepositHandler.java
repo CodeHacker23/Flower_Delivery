@@ -33,7 +33,7 @@ public class CourierDepositHandler {
 
     public void startTopUp(Long telegramId, Long chatId) {
         awaitingAmount.put(telegramId, true);
-        log.info("🛰️ Старт пополнения депозита курьера: telegramId={}, chatId={}", telegramId, chatId);
+        log.info("Старт пополнения депозита курьера: telegramId={}, chatId={}", telegramId, chatId);
         SendMessage msg = SendMessage.builder()
                 .chatId(chatId.toString())
                 .text("💳 *Пополнение депозита*\n\n" +

@@ -204,6 +204,13 @@ public class Order {
     @Column(name = "shop_pickup_confirmed_at")
     private LocalDateTime shopPickupConfirmedAt;
 
+    /**
+     * Причина отмены или возврата заказа, указанная курьером.
+     * Передаётся админам и в уведомление магазину.
+     */
+    @Column(name = "courier_cancel_reason", columnDefinition = "TEXT")
+    private String courierCancelReason;
+
     // ============================================
     // МУЛЬТИАДРЕСНАЯ ДОСТАВКА
     // ============================================

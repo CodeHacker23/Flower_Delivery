@@ -53,6 +53,23 @@ public class CourierTransactionService {
                 courier.getId(), order != null ? order.getId() : null, amount);
     }
 
+    @Transactional
+    public void addPenalty(Courier courier, Order order, String penaltyType, BigDecimal amount, String description) {
+        if (courier == null || amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
+            return;
+        }
+        CourierTransaction tx = CourierTransaction.builder()
+                .courier(courier)
+                .type(penaltyType)
+                .amount(amount.negate())
+                .order(order)
+                .description(description != null ? description : "Штраф " + penaltyType)
+                .build();
+        transactionRepository.save(tx);
+        log.info("Штраф {} курьеру {} по заказу {}: {}",
+                penaltyType, courier.getId(), order != null ? order.getId() : null, amount);
+    }
+
     @Transactional(readOnly = true)
     public List<CourierTransaction> getLastTransactions(Courier courier, int limit) {
         if (courier == null) {

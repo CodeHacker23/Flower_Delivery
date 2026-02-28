@@ -22,7 +22,9 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMa
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 import org.example.flower_delivery.model.OrderStop;
@@ -120,6 +122,8 @@ public class CallbackQueryHandler {
     // Сервис заказов (для отмены, редактирования и работы курьера)
     private final org.example.flower_delivery.service.OrderService orderService;
 
+    private final org.example.flower_delivery.service.OrderBundleService orderBundleService;
+
     @Autowired
     @Lazy
     private OrderEditHandler orderEditHandler;
@@ -162,7 +166,7 @@ public class CallbackQueryHandler {
         Long telegramId = callbackQuery.getFrom().getId();
         Long chatId = callbackQuery.getMessage().getChatId();
 
-        log.info("Обработка callback query: telegramId={}, callbackData={}", telegramId, callbackData);
+        log.debug("Callback: telegramId={}, data={}", telegramId, callbackData);
 
         try {
             // Обрабатываем разные типы callback_data
@@ -187,6 +191,9 @@ public class CallbackQueryHandler {
                 String priceStr = callbackData.replace("confirm_price_", "");
                 answerCallbackQuery(callbackQuery.getId(), "✅ Цена подтверждена");
                 orderCreationHandler.handlePriceConfirmation(telegramId, chatId, new java.math.BigDecimal(priceStr));
+            } else if (callbackData.equals("order_creation_cancel")) {
+                answerCallbackQuery(callbackQuery.getId(), "Заказ отменён");
+                orderCreationHandler.cancelOrderCreation(telegramId, chatId);
                 
             // ===== МУЛЬТИАДРЕСНЫЕ ЗАКАЗЫ =====
             } else if (callbackData.equals("add_stop_yes")) {
@@ -236,6 +243,16 @@ public class CallbackQueryHandler {
             } else if (callbackData.equals("courier_orders_select")) {
                 answerCallbackQuery(callbackQuery.getId(), "🔎 Выбор заказа");
                 courierAvailableOrdersHandler.startSelection(telegramId, chatId);
+            // РЕАЛИЗОВАНО: пагинация «Доступные заказы» — редактируем сообщение
+            } else if (callbackData.startsWith("courier_orders_page:")) {
+                String pageStr = callbackData.replace("courier_orders_page:", "");
+                int page = 0;
+                try {
+                    page = Integer.parseInt(pageStr);
+                } catch (NumberFormatException ignored) {}
+                Integer messageId = callbackQuery.getMessage().getMessageId();
+                courierAvailableOrdersHandler.showAvailableOrdersPage(telegramId, chatId, page, messageId);
+                answerCallbackQuery(callbackQuery.getId(), "Страница " + (page + 1));
 
             // ===== КУРЬЕР: СМЕНА СТАТУСА ЗАКАЗА =====
             } else if (callbackData.startsWith("courier_order_next:")) {
@@ -286,6 +303,11 @@ public class CallbackQueryHandler {
                 handleCourierOrderReturnConfirm(telegramId, chatId, callbackQuery.getId(), orderIdStr, listMessageId);
             } else if (callbackData.equals("courier_order_return_no")) {
                 answerCallbackQuery(callbackQuery.getId(), "Ок, не возвращаем");
+            // ===== КУРЬЕР: ВЗЯТЬ СВЯЗКУ ЗАКАЗОВ =====
+            } else if (callbackData.startsWith("courier_bundle_take:")) {
+                String indicesStr = callbackData.replace("courier_bundle_take:", "");
+                answerCallbackQuery(callbackQuery.getId(), "📦 Назначаю связку...");
+                handleCourierBundleTake(telegramId, chatId, indicesStr);
             } else {
                 log.warn("Неизвестный callback_data: {}", callbackData);
                 answerCallbackQuery(callbackQuery.getId(), "❌ Неизвестная команда");
@@ -393,16 +415,20 @@ public class CallbackQueryHandler {
      * @param text - текст сообщения
      */
     private void sendMessage(Long chatId, String text) {
+        sendMessage(chatId, text, null);
+    }
+
+    private void sendMessage(Long chatId, String text, InlineKeyboardMarkup replyMarkup) {
         try {
-            SendMessage message = SendMessage.builder()
+            SendMessage.SendMessageBuilder builder = SendMessage.builder()
                     .chatId(chatId.toString())
                     .text(text)
-                    .parseMode("Markdown")  // Поддержка Markdown (жирный текст, курсив и т.д.)
-                    .build();
-
-            bot.execute(message);
+                    .parseMode("Markdown");
+            if (replyMarkup != null) {
+                builder.replyMarkup(replyMarkup);
+            }
+            bot.execute(builder.build());
             log.debug("Сообщение отправлено: chatId={}", chatId);
-
         } catch (TelegramApiException e) {
             log.error("Ошибка при отправке сообщения: chatId={}", chatId, e);
         }
@@ -456,7 +482,7 @@ public class CallbackQueryHandler {
      * Показать подтверждение отмены заказа курьером.
      */
     private void handleCourierOrderCancelAsk(Long chatId, String orderIdStr) {
-        log.info("🛰️ Курьер запросил подтверждение отмены заказа: orderIdStr={}", orderIdStr);
+        log.info("Курьер запросил подтверждение отмены заказа: orderIdStr={}", orderIdStr);
         String text = "❓ *Отменить этот заказ как курьер?*\n\n" +
                 "После отмены заказ уйдёт из твоего списка и вернётся в работу магазину/админу.";
         InlineKeyboardButton btnYes = InlineKeyboardButton.builder()
@@ -528,7 +554,7 @@ public class CallbackQueryHandler {
     }
 
     /**
-     * Курьер подтвердил отмену заказа.
+     * Курьер подтвердил отмену заказа — переходим к вводу причины.
      */
     private void handleCourierOrderCancelConfirm(Long telegramId, Long chatId, String callbackQueryId,
                                                  String orderIdStr, Integer listMessageId) {
@@ -545,32 +571,12 @@ public class CallbackQueryHandler {
             answerCallbackQuery(callbackQueryId, "❌ Нет активного профиля курьера");
             return;
         }
-        var courier = courierOpt.get();
-        boolean cancelled = orderService.cancelOrderByCourier(orderId, courier.getUser());
-        if (cancelled) {
-            answerCallbackQuery(callbackQueryId, "✅ Заказ отменён");
-            // Уведомляем магазин, что курьер отменил заказ
-            orderService.getOrderForShopPickupMessage(orderId).ifPresent(order -> {
-                Shop shop = order.getShop();
-                if (shop != null && shop.getUser() != null && shop.getUser().getTelegramId() != null) {
-                    Long shopChatId = shop.getUser().getTelegramId();
-                    String text = "⚠️ *Заказ отменён курьером*\n\n" +
-                            "Получатель: " + order.getRecipientName() + "\n" +
-                            "Адрес: " + order.getDeliveryAddress() + "\n\n" +
-                            "Курьер: " + courier.getFullName();
-                    sendMessage(shopChatId, text);
-                }
-            });
-            if (listMessageId != null) {
-                bot.editCourierMyOrdersMessage(chatId, listMessageId, telegramId);
-            }
-        } else {
-            answerCallbackQuery(callbackQueryId, "❌ Не удалось отменить заказ");
-        }
+        answerCallbackQuery(callbackQueryId, "📝 Укажи причину отмены");
+        bot.startAwaitingCancelReason(telegramId, chatId, orderId, false);
     }
 
     /**
-     * Курьер подтвердил возврат заказа в магазин.
+     * Курьер подтвердил возврат заказа в магазин — переходим к вводу причины.
      */
     private void handleCourierOrderReturnConfirm(Long telegramId, Long chatId, String callbackQueryId,
                                                  String orderIdStr, Integer listMessageId) {
@@ -587,40 +593,73 @@ public class CallbackQueryHandler {
             answerCallbackQuery(callbackQueryId, "❌ Нет активного профиля курьера");
             return;
         }
-        var courier = courierOpt.get();
-        boolean returned = orderService.returnOrderToShopByCourier(orderId, courier.getUser());
-        if (returned) {
-            answerCallbackQuery(callbackQueryId, "✅ Заказ помечен как возвращён в магазин");
-            // Уведомляем магазин, что курьер вернул заказ, и при необходимости подсказываем маршрут курьеру.
-            orderService.getOrderForShopPickupMessage(orderId).ifPresent(order -> {
-                Shop shop = order.getShop();
-                if (shop != null && shop.getUser() != null && shop.getUser().getTelegramId() != null) {
-                    Long shopChatId = shop.getUser().getTelegramId();
-                    String text = "↩️ *Заказ возвращён в магазин курьером*\n\n" +
-                            "Получатель: " + order.getRecipientName() + "\n" +
-                            "Адрес: " + order.getDeliveryAddress() + "\n\n" +
-                            "Курьер: " + courier.getFullName();
-                    sendMessage(shopChatId, text);
-                }
+        answerCallbackQuery(callbackQueryId, "📝 Укажи причину возврата");
+        bot.startAwaitingCancelReason(telegramId, chatId, orderId, true);
+    }
 
-                // Если других активных заказов нет — подсказываем курьеру маршрут обратно в магазин.
-                var allForCourier = orderService.getOrdersByCourierWithShop(courier.getUser());
-                boolean hasOtherActive = allForCourier.stream().anyMatch(o ->
-                        !o.getId().equals(order.getId()) &&
-                                (o.getStatus() == OrderStatus.ACCEPTED
-                                        || o.getStatus() == OrderStatus.IN_SHOP
-                                        || o.getStatus() == OrderStatus.PICKED_UP
-                                        || o.getStatus() == OrderStatus.ON_WAY));
-                if (!hasOtherActive) {
-                    bot.sendReturnToShopRoute(courier, order);
-                }
-            });
-            if (listMessageId != null) {
-                bot.editCourierMyOrdersMessage(chatId, listMessageId, telegramId);
+    /**
+     * Курьер нажал «Взять связку» — назначаем все заказы связки.
+     */
+    private void handleCourierBundleTake(Long telegramId, Long chatId, String indicesStr) {
+        List<Integer> indices = new java.util.ArrayList<>();
+        for (String s : indicesStr.split(",")) {
+            try {
+                indices.add(Integer.parseInt(s.trim()));
+            } catch (NumberFormatException ignored) {
             }
-        } else {
-            answerCallbackQuery(callbackQueryId, "❌ Не удалось пометить заказ как возвращённый");
         }
+        if (indices.size() < 2 || indices.size() > 3) {
+            sendMessage(chatId, "❌ Некорректная связка. Попробуй снова через «📋 Доступные заказы».");
+            return;
+        }
+        List<UUID> orderIds = courierAvailableOrdersHandler.getOrderIdsForIndices(telegramId, indices);
+        if (orderIds.size() != indices.size()) {
+            sendMessage(chatId, "❌ Список заказов устарел.\nНажми «📋 Доступные заказы» и попробуй снова.");
+            return;
+        }
+        var courierOpt = courierService.findByTelegramId(telegramId);
+        if (courierOpt.isEmpty() || !Boolean.TRUE.equals(courierOpt.get().getIsActive())) {
+            sendMessage(chatId, "❌ Нет активного профиля курьера.");
+            return;
+        }
+        List<Order> assigned = orderService.assignBundleToCourier(orderIds, courierOpt.get().getUser());
+        if (assigned.isEmpty()) {
+            sendMessage(chatId, "❌ Не удалось взять связку.\n" +
+                    "Возможно: заказы уже заняты, превышен лимит (3 активных) или не хватает средств на депозите.");
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("✅ *Связка взята!* (").append(assigned.size()).append(" заказов)\n\n");
+        List<Order> withShops = new ArrayList<>();
+        for (int i = 0; i < assigned.size(); i++) {
+            Order o = assigned.get(i);
+            var withShop = orderService.getOrderWithShop(o.getId()).orElse(o);
+            withShops.add(withShop);
+            sb.append(i + 1).append(". ").append(o.getRecipientName()).append(" — ").append(o.getDeliveryAddress()).append("\n");
+            if (withShop.getShop() != null && withShop.getShop().getPickupAddress() != null) {
+                sb.append("   🏪 Забрать: ").append(withShop.getShop().getPickupAddress()).append("\n");
+            }
+        }
+        sb.append("\nНажми «🚚 Мои заказы» для смены статусов.");
+
+        // Кнопки маршрута (Яндекс/2ГИС) — только после взятия связки: курьер → магазин → доставки по пути
+        InlineKeyboardMarkup markup = null;
+        var courier = courierOpt.get();
+        if (courier.getLastLatitude() != null && courier.getLastLongitude() != null) {
+            double lat = courier.getLastLatitude().doubleValue();
+            double lon = courier.getLastLongitude().doubleValue();
+            Optional<org.example.flower_delivery.service.OrderBundleService.OrderBundle> routeOpt =
+                    orderBundleService.buildRouteForOrders(withShops, lat, lon);
+            if (routeOpt.isPresent()) {
+                var bundle = routeOpt.get();
+                List<InlineKeyboardButton> row = List.of(
+                        InlineKeyboardButton.builder().text("🌍 Яндекс").url(bundle.yandexRouteUrl()).build(),
+                        InlineKeyboardButton.builder().text("🗺 2ГИС").url(bundle.twoGisRouteUrl()).build()
+                );
+                markup = new InlineKeyboardMarkup(List.of(row));
+            }
+        }
+        sendMessage(chatId, sb.toString(), markup);
     }
 
     /**

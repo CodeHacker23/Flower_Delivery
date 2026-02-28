@@ -24,11 +24,16 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Хендлер выбора заказа курьером из списка "📋 Доступные заказы".
  *
+ * РЕАЛИЗОВАНО:
+ * - Пагинация: 10 заказов на страницу, кнопки «← Назад» / «Дальше →»
+ * - showAvailableOrdersPage() редактирует сообщение (EditMessageText)
+ * - Номера при выборе — локальные на странице (1–10)
+ * - Связки и «Выбрать заказ» учитывают текущую страницу
+ *
  * Логика:
- * 1. Bot формирует список доступных заказов и вызывает saveLastAvailableOrders().
- * 2. При нажатии "🔎 Выбрать заказ" мы просим ввести номер или ID.
- * 3. Следующее текстовое сообщение интерпретируем как выбор заказа.
- * 4. Пытаемся назначить заказ курьеру через OrderService.assignOrderToCourier().
+ * 1. Bot формирует список и вызывает saveLastAvailableOrders() + saveLastAvailableCourierLocation().
+ * 2. При нажатии "🔎 Выбрать заказ" — ввод номера (1–10 на странице).
+ * 3. OrderService.assignOrderToCourier().
  */
 @Slf4j
 @Component
@@ -44,6 +49,15 @@ public class CourierAvailableOrdersHandler {
 
     /** Последний показанный список доступных заказов для курьера (только ID). */
     private final Map<Long, List<UUID>> lastAvailableOrderIdsByUser = new ConcurrentHashMap<>();
+
+    /** Текущая страница списка «Доступные заказы» (0-based). */
+    private final Map<Long, Integer> lastAvailableOrdersPageByUser = new ConcurrentHashMap<>();
+
+    /** Координаты курьера при последнем показе списка (для пагинации). */
+    private final Map<Long, double[]> lastAvailableCourierLocation = new ConcurrentHashMap<>();
+
+    /** Заказов на страницу. */
+    public static final int ORDERS_PER_PAGE = 10;
 
     /** telegramId'ы, от которых мы сейчас ждём номер/ID заказа. */
     private final Map<Long, Boolean> awaitingSelection = new ConcurrentHashMap<>();
@@ -68,11 +82,11 @@ public class CourierAvailableOrdersHandler {
      */
     public void handleLocationForAvailableList(Long telegramId, Long chatId, double lat, double lon) {
         courierService.updateLastLocation(telegramId, lat, lon);
-        // Честное распределение: первые 5 — ближайшие, следующие 5 — от магазинов, которым курьер мало отдавал за 24 ч
+        // Честное распределение: 10 ближайших + 10 от «других» магазинов
         List<Order> sorted;
         var courierOpt = courierService.findByTelegramId(telegramId);
         if (courierOpt.isPresent() && courierOpt.get().getUser() != null) {
-            sorted = orderService.getAvailableOrdersWithFairness(lat, lon, courierOpt.get().getUser(), 5, 5);
+            sorted = orderService.getAvailableOrdersWithFairness(lat, lon, courierOpt.get().getUser(), 10, 10);
         } else {
             sorted = orderService.getAvailableOrdersSortedByDistanceFrom(lat, lon);
         }
@@ -81,21 +95,57 @@ public class CourierAvailableOrdersHandler {
             send(chatId, "📋 *Доступные заказы*\n\nСейчас нет свободных заказов.");
             return;
         }
-        int limit = Math.min(10, sorted.size());
-        List<Order> ordersToShow = sorted.subList(0, limit);
-        saveLastAvailableOrders(telegramId, ordersToShow);
-        var content = bot.buildAvailableOrdersContentWithLocation(ordersToShow, lat, lon);
-        SendMessage message = new SendMessage();
-        message.setChatId(chatId.toString());
-        message.setText(content.text());
-        message.setParseMode("Markdown");
-        message.setReplyMarkup(content.markup());
-        try {
-            bot.execute(message);
-            clearAwaitingLocationForList(telegramId); // сбрасываем только после успешной отправки
-        } catch (TelegramApiException e) {
-            log.error("Ошибка отправки списка доступных заказов: chatId={}", chatId, e);
+        saveLastAvailableOrders(telegramId, sorted);
+        lastAvailableOrdersPageByUser.put(telegramId, 0);
+        lastAvailableCourierLocation.put(telegramId, new double[]{lat, lon});
+        showAvailableOrdersPage(telegramId, chatId, 0, null);
+        clearAwaitingLocationForList(telegramId);
+    }
+
+    /**
+     * Показать страницу списка «Доступные заказы». Редактирует сообщение, если messageId задан.
+     */
+    public void showAvailableOrdersPage(Long telegramId, Long chatId, int page, Integer messageId) {
+        List<UUID> ids = lastAvailableOrderIdsByUser.get(telegramId);
+        if (ids == null || ids.isEmpty()) {
+            send(chatId, "❌ Список доступных заказов устарел.\nНажми ещё раз «📋 Доступные заказы».");
+            return;
         }
+        double[] loc = lastAvailableCourierLocation.get(telegramId);
+        if (loc == null || loc.length < 2) {
+            send(chatId, "❌ Нет геолокации для списка.\nНажми «📋 Доступные заказы» и отправь гео.");
+            return;
+        }
+        int totalPages = (ids.size() + ORDERS_PER_PAGE - 1) / ORDERS_PER_PAGE;
+        if (page < 0) page = 0;
+        if (page >= totalPages) page = totalPages - 1;
+        lastAvailableOrdersPageByUser.put(telegramId, page);
+
+        int from = page * ORDERS_PER_PAGE;
+        int to = Math.min(from + ORDERS_PER_PAGE, ids.size());
+        List<UUID> pageIds = ids.subList(from, to);
+        List<Order> ordersToShow = orderService.findByIdsWithShop(pageIds);
+
+        var content = bot.buildAvailableOrdersContentWithLocation(ordersToShow, loc[0], loc[1],
+                page, totalPages, ids.size());
+        try {
+            if (messageId != null) {
+                bot.editAvailableOrdersMessage(chatId, messageId, content.text(), content.markup());
+            } else {
+                SendMessage message = new SendMessage();
+                message.setChatId(chatId.toString());
+                message.setText(content.text());
+                message.setParseMode("Markdown");
+                message.setReplyMarkup(content.markup());
+                bot.execute(message);
+            }
+        } catch (TelegramApiException e) {
+            log.error("Ошибка показа страницы доступных заказов: chatId={}", chatId, e);
+        }
+    }
+
+    public int getCurrentPage(Long telegramId) {
+        return lastAvailableOrdersPageByUser.getOrDefault(telegramId, 0);
     }
 
     /** Сохранить список доступных заказов для курьера. */
@@ -108,6 +158,27 @@ public class CourierAvailableOrdersHandler {
         log.debug("Сохранён список {} доступных заказов для курьера {}", ids.size(), telegramId);
     }
 
+    /** Сохранить геолокацию курьера для списка (нужно для пагинации). */
+    public void saveLastAvailableCourierLocation(Long telegramId, double lat, double lon) {
+        lastAvailableCourierLocation.put(telegramId, new double[]{lat, lon});
+    }
+
+    /** Получить ID заказов по индексам из списка (индексы 1-based на текущей странице). */
+    public List<UUID> getOrderIdsForIndices(Long telegramId, List<Integer> indices) {
+        List<UUID> ids = lastAvailableOrderIdsByUser.get(telegramId);
+        if (ids == null || ids.isEmpty()) return List.of();
+        int page = lastAvailableOrdersPageByUser.getOrDefault(telegramId, 0);
+        int offset = page * ORDERS_PER_PAGE;
+        List<UUID> result = new ArrayList<>();
+        for (int idx : indices) {
+            int globalIdx = offset + (idx - 1);
+            if (globalIdx >= 0 && globalIdx < ids.size()) {
+                result.add(ids.get(globalIdx));
+            }
+        }
+        return result;
+    }
+
     /** Начать процесс выбора заказа (после нажатия inline-кнопки "Выбрать заказ"). */
     public void startSelection(Long telegramId, Long chatId) {
         List<UUID> ids = lastAvailableOrderIdsByUser.get(telegramId);
@@ -117,8 +188,12 @@ public class CourierAvailableOrdersHandler {
             return;
         }
         awaitingSelection.put(telegramId, true);
+        int page = lastAvailableOrdersPageByUser.getOrDefault(telegramId, 0);
+        int from = page * ORDERS_PER_PAGE;
+        int to = Math.min(from + ORDERS_PER_PAGE, ids.size());
+        int maxOnPage = to - from;
         send(chatId, "🔎 *Выбор заказа*\n\n" +
-                "Введи *номер* заказа из списка (1-" + ids.size() + ").");
+                "Введи *номер* заказа из списка на этой странице (1-" + maxOnPage + ").");
     }
 
     public boolean isAwaitingSelection(Long telegramId) {
@@ -144,12 +219,17 @@ public class CourierAvailableOrdersHandler {
         }
 
         UUID orderId = null;
+        int page = lastAvailableOrdersPageByUser.getOrDefault(telegramId, 0);
+        int from = page * ORDERS_PER_PAGE;
+        int to = Math.min(from + ORDERS_PER_PAGE, ids.size());
+        int maxOnPage = to - from;
 
-        // Пытаемся считать номер из списка (1..N)
+        // Пытаемся считать номер из списка на текущей странице (1..maxOnPage)
         try {
             int index = Integer.parseInt(text.trim());
-            if (index >= 1 && index <= ids.size()) {
-                orderId = ids.get(index - 1);
+            if (index >= 1 && index <= maxOnPage) {
+                int globalIdx = from + (index - 1);
+                orderId = ids.get(globalIdx);
             }
         } catch (NumberFormatException ignored) {
             // не число
@@ -158,7 +238,7 @@ public class CourierAvailableOrdersHandler {
         // Неверный ввод — НЕ выходим из режима выбора, чтобы можно было ввести номер снова
         if (orderId == null) {
             send(chatId, "❌ Не удалось распознать номер заказа.\n" +
-                    "Введи число от 1 до " + ids.size() + ".");
+                    "Введи число от 1 до " + maxOnPage + ".");
             return true;
         }
 
@@ -237,20 +317,27 @@ public class CourierAvailableOrdersHandler {
             sb.append("📅 Дата доставки: ").append(orderWithShop.getDeliveryDate()).append("\n");
         }
 
-        // Кнопка «Маршрут до магазина» — после выбора заказа (Яндекс.Карты)
+        // Кнопки «Яндекс.Карты» и «2ГИС» — маршрут до магазина
         if (orderWithShop.getShop() != null
                 && orderWithShop.getShop().getLatitude() != null
                 && orderWithShop.getShop().getLongitude() != null
                 && courier.getLastLatitude() != null
                 && courier.getLastLongitude() != null) {
-            String routeUrl = buildYandexRouteUrl(
-                    courier.getLastLatitude().doubleValue(), courier.getLastLongitude().doubleValue(),
-                    orderWithShop.getShop().getLatitude().doubleValue(), orderWithShop.getShop().getLongitude().doubleValue());
-            InlineKeyboardButton routeBtn = InlineKeyboardButton.builder()
-                    .text("🗺 Маршрут до магазина")
-                    .url(routeUrl)
+            double fromLat = courier.getLastLatitude().doubleValue();
+            double fromLon = courier.getLastLongitude().doubleValue();
+            double toLat = orderWithShop.getShop().getLatitude().doubleValue();
+            double toLon = orderWithShop.getShop().getLongitude().doubleValue();
+            String yandexUrl = buildYandexRouteUrl(fromLat, fromLon, toLat, toLon);
+            String twoGisUrl = build2GisRouteUrl(fromLat, fromLon, toLat, toLon);
+            InlineKeyboardButton yandexBtn = InlineKeyboardButton.builder()
+                    .text("🌍 Яндекс")
+                    .url(yandexUrl)
                     .build();
-            InlineKeyboardMarkup markup = new InlineKeyboardMarkup(List.of(List.of(routeBtn)));
+            InlineKeyboardButton twoGisBtn = InlineKeyboardButton.builder()
+                    .text("🗺 2ГИС")
+                    .url(twoGisUrl)
+                    .build();
+            InlineKeyboardMarkup markup = new InlineKeyboardMarkup(List.of(List.of(yandexBtn, twoGisBtn)));
             send(chatId, sb.toString(), markup);
         } else {
             send(chatId, sb.toString());
@@ -260,6 +347,12 @@ public class CourierAvailableOrdersHandler {
 
     private static String buildYandexRouteUrl(double fromLat, double fromLon, double toLat, double toLon) {
         return "https://yandex.ru/maps/?rtext=" + fromLat + "," + fromLon + "~" + toLat + "," + toLon + "&rtt=auto";
+    }
+
+    private static String build2GisRouteUrl(double fromLat, double fromLon, double toLat, double toLon) {
+        // 2ГИС routeSearch: только точка Б (магазин), точка А = GPS пользователя. Формат to/lon,lat (документация)
+        String to = toLon + "," + toLat;
+        return "https://2gis.ru/routeSearch/rsType/car/to/" + to;
     }
 
     private void send(Long chatId, String text) {

@@ -45,7 +45,7 @@ public class YooKassaPaymentService {
             return null;
         }
         try {
-            log.info("🛰️ Запрос создания платежа в ЮKassa: telegramId={}, amount={}", telegramId, amount);
+            log.info("Запрос создания платежа ЮKassa: telegramId={}, amount={}", telegramId, amount);
             String url = "https://api.yookassa.ru/v3/payments";
 
             Map<String, Object> body = new HashMap<>();

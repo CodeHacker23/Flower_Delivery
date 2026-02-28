@@ -71,20 +71,14 @@ public class GeocodingService {
             
             // Добавляем город к адресу
             String fullAddress = regionConfig.enrichAddress(cleanAddress);
-            log.info("=== DADATA GEOCODING ===");
-            log.info("Адрес для геокодирования: {}", fullAddress);
-            log.info("API Key (первые 10 символов): {}...", apiKey.substring(0, Math.min(10, apiKey.length())));
+            log.debug("Геокодирование адреса: {}", fullAddress);
 
             // Формируем запрос к DaData (API подсказок)
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(new MediaType("application", "json", StandardCharsets.UTF_8));
             headers.setAcceptCharset(java.util.List.of(StandardCharsets.UTF_8));
             headers.set("Authorization", "Token " + apiKey);
-            // API подсказок НЕ требует X-Secret!
 
-            // Используем HttpURLConnection для полного контроля над кодировкой
-            log.info("DaData URL: {}", DADATA_URL);
-            
             java.net.URL url = new java.net.URL(DADATA_URL);
             java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
@@ -96,18 +90,14 @@ public class GeocodingService {
             // Формируем JSON и отправляем как UTF-8 bytes
             String jsonQuery = "{\"query\":\"" + fullAddress.replace("\"", "\\\"") + "\",\"count\":1}";
             byte[] jsonBytes = jsonQuery.getBytes(StandardCharsets.UTF_8);
-            
-            log.info("DaData request (UTF-8 bytes length): {}", jsonBytes.length);
-            log.info("DaData request JSON: {}", jsonQuery);
-            
+
             try (java.io.OutputStream os = conn.getOutputStream()) {
                 os.write(jsonBytes);
                 os.flush();
             }
             
             int responseCode = conn.getResponseCode();
-            log.info("DaData response code: {}", responseCode);
-            
+
             // Читаем ответ
             StringBuilder responseBody = new StringBuilder();
             try (java.io.BufferedReader br = new java.io.BufferedReader(
@@ -119,7 +109,6 @@ public class GeocodingService {
             }
             
             String responseStr = responseBody.toString();
-            log.info("DaData response body: {}", responseStr);
 
             if (responseCode != 200 || responseStr.isEmpty()) {
                 log.error("DaData вернул ошибку: status={}", responseCode);
@@ -162,37 +151,20 @@ public class GeocodingService {
             String region = getTextOrEmpty(data, "region");
             String resultAddress = getTextOrEmpty(firstSuggestion, "value");
 
-            log.info("Геокодирование успешно: lat={}, lon={}, city={}, region={}", 
+            log.debug("Геокодирование успешно: lat={}, lon={}, city={}, region={}", 
                     lat, lon, city, region);
 
             return Optional.of(new GeocodingResult(lat, lon, resultAddress, city, region));
 
         } catch (org.springframework.web.client.HttpClientErrorException e) {
-            log.error("=== DADATA HTTP ERROR ===");
-            log.error("Status: {}", e.getStatusCode());
-            log.error("Response: {}", e.getResponseBodyAsString());
-            log.error("Message: {}", e.getMessage());
+            log.warn("DaData HTTP ошибка: status={}, response={}", e.getStatusCode(), e.getResponseBodyAsString());
             return Optional.empty();
         } catch (Exception e) {
-            log.error("=== DADATA EXCEPTION ===");
-            log.error("Тип ошибки: {}", e.getClass().getName());
-            log.error("Сообщение: {}", e.getMessage());
-            log.error("Stack trace:", e);
+            log.warn("Ошибка геокодирования: {}", e.getMessage(), e);
             return Optional.empty();
         }
     }
     
-    /**
-     * Экранировать строку для JSON.
-     */
-    private String escapeJson(String text) {
-        return text.replace("\\", "\\\\")
-                   .replace("\"", "\\\"")
-                   .replace("\n", "\\n")
-                   .replace("\r", "\\r")
-                   .replace("\t", "\\t");
-    }
-
     /**
      * Очистить адрес для геокодирования — убрать подъезд и квартиру.
      * DaData не понимает "п2 кв 25", ему нужен только адрес до дома.
@@ -213,7 +185,7 @@ public class GeocodingService {
         // Убираем лишние пробелы и запятые в конце
         clean = clean.replaceAll("[,\\s]+$", "").trim();
         
-        log.info("Адрес очищен: '{}' → '{}'", address, clean);
+        log.debug("Адрес очищен: '{}' → '{}'", address, clean);
         return clean;
     }
 

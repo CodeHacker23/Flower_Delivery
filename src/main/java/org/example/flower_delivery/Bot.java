@@ -14,6 +14,7 @@ import org.example.flower_delivery.model.Courier;
 import org.example.flower_delivery.model.Order;
 import org.example.flower_delivery.model.OrderStatus;
 import org.example.flower_delivery.model.Shop;
+import org.example.flower_delivery.service.OrderBundleService;
 import org.example.flower_delivery.service.OrderService;
 import org.example.flower_delivery.service.ShopService;
 import org.example.flower_delivery.service.UserService;
@@ -96,6 +97,9 @@ public class Bot extends TelegramLongPollingBot {
 
     // Обработчик редактирования заказа (меню + ввод нового значения)
     private final org.example.flower_delivery.handler.OrderEditHandler orderEditHandler;
+
+    // Сервис связок заказов (подбор 2–3 заказов по пути)
+    private final OrderBundleService orderBundleService;
     
     // Инжектируем сервис магазинов (для временной команды /activate)
     private final ShopService shopService;
@@ -114,6 +118,11 @@ public class Bot extends TelegramLongPollingBot {
 
     /** Ожидание ввода номера заказа для отмены курьером: telegramId -> список UUID активных заказов. */
     private final Map<Long, List<UUID>> awaitingCancelSelection = new ConcurrentHashMap<>();
+
+    /** Ожидание причины отмены/возврата: telegramId -> (orderId, isReturn). */
+    private final Map<Long, PendingCancelReason> awaitingCancelReason = new ConcurrentHashMap<>();
+
+    private record PendingCancelReason(UUID orderId, boolean isReturn) {}
     
     /**
      * Метод который вызывается КАЖДЫЙ РАЗ когда приходит новое сообщение/команда/кнопка
@@ -130,6 +139,22 @@ public class Bot extends TelegramLongPollingBot {
      */
     @Override
     public void onUpdateReceived(Update update) {
+        Long telegramId = update.hasCallbackQuery()
+                ? update.getCallbackQuery().getFrom().getId()
+                : (update.hasMessage() && update.getMessage().getFrom() != null
+                        ? update.getMessage().getFrom().getId()
+                        : null);
+        log.debug("Update received: telegramId={}, hasCallback={}, hasMessage={}",
+                telegramId, update.hasCallbackQuery(), update.hasMessage());
+
+        try {
+            processUpdate(update);
+        } catch (Exception e) {
+            log.error("Ошибка при обработке update: telegramId={}", telegramId, e);
+        }
+    }
+
+    private void processUpdate(Update update) {
         // Проверяем, есть ли нажатие на кнопку (callback query)
         if (update.hasCallbackQuery()) {
             callbackQueryHandler.handle(update);
@@ -234,6 +259,13 @@ public class Bot extends TelegramLongPollingBot {
                 }
             }
 
+            // Если курьер вводит причину отмены/возврата
+            if (awaitingCancelReason.containsKey(telegramId)) {
+                if (handleCourierCancelReasonText(telegramId, chatId, text)) {
+                    return;
+                }
+            }
+
             // Если курьер выбирает номер заказа для отмены
             if (awaitingCancelSelection.containsKey(telegramId)) {
                 if (handleCourierCancelSelectionText(telegramId, chatId, text)) {
@@ -287,7 +319,7 @@ public class Bot extends TelegramLongPollingBot {
             // Здесь позже добавим обработку других команд (/help, /orders и т.д.)
         }
     }
-    
+
     /**
      * Обработка кнопки "Мои заказы" — показать список заказов магазина.
      */
@@ -481,16 +513,7 @@ public class Bot extends TelegramLongPollingBot {
         }
 
         courierService.activateCourier(courier);
-        // ВРЕМЕННО ДЛЯ ТЕСТИРОВАНИЯ:
-        // При активации через /k сразу выдаём курьеру тестовый баланс 1000 ₽,
-        // чтобы можно было спокойно тестировать комиссию/депозит.
-        // TODO: убрать автопополнение баланса 1000 ₽ перед продакшеном.
-        courier.setBalance(new java.math.BigDecimal("1000.00"));
-        org.example.flower_delivery.model.User courierUser = courier.getUser();
-        if (courierUser != null) {
-            // Логируем для наглядности
-            log.info("Тестовый баланс курьера {} установлен на 1000 ₽ через /k", courier.getId());
-        }
+        // Баланс пополняется через ЮKassa или вручную (scripts/deposit_topup.sql)
         // После активации сразу показываем меню курьера
         sendCourierMenu(chatId, "✅ *Профиль курьера активирован!*\n\n" +
                 "Теперь ты можешь выбирать заказы и работать курьером.");
@@ -590,7 +613,8 @@ public class Bot extends TelegramLongPollingBot {
 
     /**
      * Кнопка "📋 Доступные заказы" в меню курьера.
-     * Пока заглушка: позже сюда добавим выбор и сортировку по расстоянию.
+     * РЕАЛИЗОВАНО: сортировка по расстоянию, честное распределение (10+10),
+     * пагинация 10 на страницу, связки, выбор заказа. См. docs/COURIER_MODULE_STATUS.md
      */
     private void handleCourierAvailableOrdersButton(Update update) {
         Long telegramId = update.getMessage().getFrom().getId();
@@ -628,10 +652,10 @@ public class Bot extends TelegramLongPollingBot {
 
         List<Order> availableOrders;
         if (hasFreshLocation) {
-            // Честное распределение: первые 5 — ближайшие, следующие 5 — от «других» магазинов (кому курьер мало отдавал за 24 ч)
+            // Честное распределение: 10 ближайших + 10 от «других» магазинов (при 400 заказах — до 80 из БД)
             availableOrders = orderService.getAvailableOrdersWithFairness(
                     courier.getLastLatitude().doubleValue(), courier.getLastLongitude().doubleValue(),
-                    courier.getUser(), 5, 5);
+                    courier.getUser(), 10, 10);
         } else {
             availableOrders = orderService.getAvailableOrdersWithShop();
         }
@@ -643,24 +667,11 @@ public class Bot extends TelegramLongPollingBot {
             return;
         }
 
-        int limit = Math.min(10, availableOrders.size());
-        List<Order> ordersToShow = availableOrders.subList(0, limit);
-
         if (hasFreshLocation) {
-            // Список с расстоянием и кнопками «Маршрут до магазина»
-            var content = buildAvailableOrdersContentWithLocation(ordersToShow,
+            courierAvailableOrdersHandler.saveLastAvailableOrders(telegramId, availableOrders);
+            courierAvailableOrdersHandler.saveLastAvailableCourierLocation(telegramId,
                     courier.getLastLatitude().doubleValue(), courier.getLastLongitude().doubleValue());
-            courierAvailableOrdersHandler.saveLastAvailableOrders(telegramId, ordersToShow);
-            SendMessage message = new SendMessage();
-            message.setChatId(chatId.toString());
-            message.setText(content.text());
-            message.setParseMode("Markdown");
-            message.setReplyMarkup(content.markup());
-            try {
-                execute(message);
-            } catch (TelegramApiException e) {
-                log.error("Ошибка отправки списка доступных заказов курьеру: chatId={}", chatId, e);
-            }
+            courierAvailableOrdersHandler.showAvailableOrdersPage(telegramId, chatId, 0, null);
             return;
         }
 
@@ -691,13 +702,29 @@ public class Bot extends TelegramLongPollingBot {
         }
     }
 
-    /** Текст и клавиатура списка «Доступные заказы» с расстоянием и кнопками «Маршрут до магазина» (Яндекс). */
+    /** Текст и клавиатура списка «Доступные заказы». РЕАЛИЗОВАНО: пагинация (page, totalPages), кнопки «← Назад» / «Дальше →». */
     public record AvailableOrdersContent(String text, InlineKeyboardMarkup markup) {}
 
-    public AvailableOrdersContent buildAvailableOrdersContentWithLocation(List<Order> ordersToShow, double courierLat, double courierLon) {
+    public AvailableOrdersContent buildAvailableOrdersContentWithLocation(List<Order> ordersToShow, double courierLat, double courierLon,
+                                                                         int page, int totalPages, int totalCount) {
         StringBuilder sb = new StringBuilder();
         sb.append("📋 *Доступные заказы* (от ближайших)\n\n");
-        sb.append("Показаны ").append(ordersToShow.size()).append(" заказов:\n\n");
+
+        // Связки заказов по пути (если есть 2+ заказа с координатами)
+        List<OrderBundleService.OrderBundle> bundles = orderBundleService.findRecommendedBundles(ordersToShow, courierLat, courierLon);
+        if (!bundles.isEmpty()) {
+            sb.append("📦 *Рекомендуемые связки по пути:*\n\n");
+            for (int b = 0; b < bundles.size(); b++) {
+                OrderBundleService.OrderBundle bundle = bundles.get(b);
+                String indicesStr = bundle.indicesInList().stream().map(String::valueOf).reduce((a, b2) -> a + ", " + b2).orElse("");
+                sb.append("• Заказы ").append(indicesStr).append(" — ")
+                        .append(String.format("%.1f", bundle.totalDistanceKm())).append(" км\n");
+            }
+            sb.append("\n");
+        }
+
+        sb.append("Страница ").append(page + 1).append("/").append(totalPages)
+                .append(" (").append(totalCount).append(" заказов)\n\n");
 
         DateTimeFormatter fmt = DateTimeFormatter.ofPattern("dd.MM HH:mm");
         for (int i = 0; i < ordersToShow.size(); i++) {
@@ -735,9 +762,31 @@ public class Bot extends TelegramLongPollingBot {
             sb.append("\n");
         }
 
-        // Только кнопка «Выбрать заказ»; маршрут показываем после выбора заказа (в сообщении «Заказ взят!»)
+        // Кнопки: Взять связку / Альтернативная связка / Выбрать заказ. Маршрут (Яндекс/2ГИС) — только после взятия в «Заказ взят!»
         List<List<InlineKeyboardButton>> keyboard = new ArrayList<>();
+        for (int b = 0; b < bundles.size(); b++) {
+            OrderBundleService.OrderBundle bundle = bundles.get(b);
+            String indicesStr = String.join(",", bundle.indicesInList().stream().map(String::valueOf).toList());
+            String indicesDisplay = String.join(", ", bundle.indicesInList().stream().map(String::valueOf).toList());
+            String btnText = (b == 0) ? "📦 Взять связку (" + indicesDisplay + ")" : "📦 Альтернативная связка (" + indicesDisplay + ")";
+            keyboard.add(List.of(
+                    InlineKeyboardButton.builder().text(btnText).callbackData("courier_bundle_take:" + indicesStr).build()
+            ));
+        }
         keyboard.add(List.of(InlineKeyboardButton.builder().text("🔎 Выбрать заказ").callbackData("courier_orders_select").build()));
+        // Пагинация: ← Назад | Дальше →
+        if (totalPages > 1) {
+            List<InlineKeyboardButton> navRow = new ArrayList<>();
+            if (page > 0) {
+                navRow.add(InlineKeyboardButton.builder().text("← Назад").callbackData("courier_orders_page:" + (page - 1)).build());
+            }
+            if (page < totalPages - 1) {
+                navRow.add(InlineKeyboardButton.builder().text("Дальше →").callbackData("courier_orders_page:" + (page + 1)).build());
+            }
+            if (!navRow.isEmpty()) {
+                keyboard.add(navRow);
+            }
+        }
         return new AvailableOrdersContent(sb.toString(), new InlineKeyboardMarkup(keyboard));
     }
 
@@ -748,10 +797,9 @@ public class Bot extends TelegramLongPollingBot {
 
     /** Ссылка на маршрут в 2ГИС: от (lat1,lon1) до (lat2,lon2). */
     private static String build2GisRouteUrl(double fromLat, double fromLon, double toLat, double toLon) {
-        // 2ГИС ожидает lon,lat; точки кодируем в URL как lon1,lat1|lon2,lat2
-        String p1 = fromLon + "%2C" + fromLat;
-        String p2 = toLon + "%2C" + toLat;
-        return "https://2gis.ru/route/points/" + p1 + "%7C" + p2;
+        // 2ГИС routeSearch: только точка Б (магазин), точка А = GPS пользователя. Формат to/lon,lat (документация)
+        String to = toLon + "," + toLat;
+        return "https://2gis.ru/routeSearch/rsType/car/to/" + to;
     }
 
     /**
@@ -1102,24 +1150,108 @@ public class Bot extends TelegramLongPollingBot {
             sendSimpleMessage(chatId, "❌ Нет активного профиля курьера.");
             return true;
         }
+        startAwaitingCancelReason(telegramId, chatId, orderId, false);
+        return true;
+    }
+
+    /**
+     * Начать ожидание причины отмены/возврата.
+     */
+    public void startAwaitingCancelReason(Long telegramId, Long chatId, UUID orderId, boolean isReturn) {
+        awaitingCancelReason.put(telegramId, new PendingCancelReason(orderId, isReturn));
+        String prompt = isReturn
+                ? "📝 *Укажи причину возврата* заказа в магазин (или /skip чтобы пропустить):\n\n_Причина передаётся в поддержку._"
+                : "📝 *Укажи причину отмены* заказа (или /skip чтобы пропустить):\n\n_Причина передаётся в поддержку._";
+        sendSimpleMessage(chatId, prompt);
+    }
+
+    /**
+     * Обработка ввода причины отмены/возврата курьером.
+     */
+    private boolean handleCourierCancelReasonText(Long telegramId, Long chatId, String text) {
+        if ("/start".equals(text) || "/cancel".equalsIgnoreCase(text.trim())) {
+            awaitingCancelReason.remove(telegramId);
+            sendSimpleMessage(chatId, "Отменено.");
+            return true;
+        }
+        if ("📋 Доступные заказы".equals(text) || "🚚 Мои заказы".equals(text)
+                || "💰 Моя статистика".equals(text) || "ℹ️ Информация".equals(text)) {
+            awaitingCancelReason.remove(telegramId);
+            return false;
+        }
+
+        PendingCancelReason pending = awaitingCancelReason.get(telegramId);
+        if (pending == null) return false;
+
+        awaitingCancelReason.remove(telegramId);
+
+        var courierOpt = courierService.findByTelegramId(telegramId);
+        if (courierOpt.isEmpty() || !Boolean.TRUE.equals(courierOpt.get().getIsActive())) {
+            sendSimpleMessage(chatId, "❌ Нет активного профиля курьера.");
+            return true;
+        }
         var courier = courierOpt.get();
-        boolean cancelled = orderService.cancelOrderByCourier(orderId, courier.getUser());
-        if (cancelled) {
+
+        String reason = "/skip".equalsIgnoreCase(text.trim()) ? null : text.trim();
+        if (reason != null && reason.isEmpty()) reason = null;
+
+        var result = pending.isReturn()
+                ? orderService.returnOrderToShopByCourier(pending.orderId(), courier.getUser(), reason)
+                : orderService.cancelOrderByCourier(pending.orderId(), courier.getUser(), reason);
+
+        UUID orderId = pending.orderId();
+        if (result.success()) {
+            String msg;
+            if (pending.isReturn()) {
+                msg = result.penaltyApplied()
+                        ? "⚠️ *Заказ возвращён в магазин.*\n\n" + (result.penaltyReason() != null ? result.penaltyReason() + "\n\n" : "") + "Подробности в «💰 Моя статистика»."
+                        : "✅ Заказ возвращён в магазин.\n\nНажми «🚚 Мои заказы» чтобы обновить список.";
+            } else {
+                msg = result.penaltyApplied()
+                        ? "⚠️ *Заказ отменён.*\n\n" + (result.penaltyReason() != null ? result.penaltyReason() + "\n\n" : "") + "Подробности в «💰 Моя статистика»."
+                        : "✅ Заказ отменён.\n\nНажми «🚚 Мои заказы» чтобы обновить список.";
+            }
+            sendCourierMenu(chatId, msg);
             // Уведомляем магазин
             orderService.getOrderForShopPickupMessage(orderId).ifPresent(order -> {
                 var shop = order.getShop();
                 if (shop != null && shop.getUser() != null && shop.getUser().getTelegramId() != null) {
                     Long shopChatId = shop.getUser().getTelegramId();
-                    String msg = "⚠️ *Заказ отменён курьером*\n\n"
+                    String action = pending.isReturn() ? "возвращён" : "отменён";
+                    String shopMsg = "⚠️ *Заказ " + action + " курьером*\n\n"
                             + "Получатель: " + order.getRecipientName() + "\n"
                             + "Адрес: " + order.getDeliveryAddress() + "\n\n"
                             + "Курьер: " + courier.getFullName();
-                    sendSimpleMessage(shopChatId, msg);
+                    if (order.getCourierCancelReason() != null && !order.getCourierCancelReason().isBlank()) {
+                        shopMsg += "\n\n📝 *Причина:* " + order.getCourierCancelReason();
+                    }
+                    sendSimpleMessage(shopChatId, shopMsg);
                 }
             });
-            sendCourierMenu(chatId, "✅ Заказ отменён.\n\nНажми «🚚 Мои заказы» чтобы обновить список.");
+            if (result.notifyAdmin()) {
+                String reasonForAdmin = orderService.getOrderForShopPickupMessage(orderId)
+                        .map(Order::getCourierCancelReason)
+                        .orElse(null);
+                notifyAdminsAboutSuspiciousCancel(telegramId, orderId, pending.isReturn(), reasonForAdmin);
+            }
+            if (pending.isReturn()) {
+                orderService.getOrderForShopPickupMessage(orderId).ifPresent(order -> {
+                    var allForCourier = orderService.getOrdersByCourierWithShop(courier.getUser());
+                    boolean hasOtherActive = allForCourier.stream().anyMatch(o ->
+                            !o.getId().equals(order.getId()) &&
+                                    (o.getStatus() == OrderStatus.ACCEPTED
+                                            || o.getStatus() == OrderStatus.IN_SHOP
+                                            || o.getStatus() == OrderStatus.PICKED_UP
+                                            || o.getStatus() == OrderStatus.ON_WAY));
+                    if (!hasOtherActive) {
+                        sendReturnToShopRoute(courier, order);
+                    }
+                });
+            }
         } else {
-            sendSimpleMessage(chatId, "❌ Не удалось отменить заказ. Возможно, он уже завершён.");
+            sendSimpleMessage(chatId, pending.isReturn()
+                    ? "❌ Не удалось вернуть заказ. Возможно, он уже завершён."
+                    : "❌ Не удалось отменить заказ. Возможно, он уже завершён.");
         }
         return true;
     }
@@ -1178,6 +1310,45 @@ public class Bot extends TelegramLongPollingBot {
                         .build());
             } catch (TelegramApiException e) {
                 log.error("Не удалось отправить администратору уведомление о проблеме гео: adminTelegramId={}, orderId={}",
+                        chatId, orderId, e);
+            }
+        }
+    }
+
+    /**
+     * Уведомить админов о «звоночке»: курьер был в магазине по гео, но не у получателя.
+     * Штрафы назначает админ вручную.
+     *
+     * @param cancelReason причина отмены/возврата от курьера (может быть null)
+     */
+    public void notifyAdminsAboutSuspiciousCancel(Long courierTelegramId, UUID orderId, boolean isReturn, String cancelReason) {
+        List<org.example.flower_delivery.model.User> admins = userService.findActiveAdmins();
+        if (admins.isEmpty()) {
+            log.warn("Нет активных админов для уведомления о подозрительной отмене: orderId={}, courierTelegramId={}",
+                    orderId, courierTelegramId);
+            return;
+        }
+        String action = isReturn ? "возвратил в магазин" : "отменил";
+        String text = "⚠️ *Звоночек: подозрительная отмена*\n\n"
+                + "Курьер telegramId: `" + courierTelegramId + "`\n"
+                + "Заказ: `" + orderId + "`\n"
+                + "Действие: " + action + "\n\n"
+                + "Гео: курьер был в магазине, но не у получателя.\n";
+        if (cancelReason != null && !cancelReason.isBlank()) {
+            text += "\n📝 *Причина от курьера:* " + cancelReason + "\n";
+        }
+        text += "\nРазобрать и при необходимости назначить штраф.";
+        for (org.example.flower_delivery.model.User admin : admins) {
+            Long chatId = admin.getTelegramId();
+            if (chatId == null) continue;
+            try {
+                execute(SendMessage.builder()
+                        .chatId(chatId.toString())
+                        .text(text)
+                        .parseMode("Markdown")
+                        .build());
+            } catch (TelegramApiException e) {
+                log.error("Не удалось отправить админу уведомление о подозрительной отмене: adminTelegramId={}, orderId={}",
                         chatId, orderId, e);
             }
         }
@@ -1252,20 +1423,39 @@ public class Bot extends TelegramLongPollingBot {
     private CourierStatsContent buildCourierStatsContent(Courier courier, List<Order> allOrders, int txOffset) {
         final int PAGE_SIZE = 6;
         java.time.LocalDate now = java.time.LocalDate.now();
+        java.time.LocalDateTime startOfToday = now.atStartOfDay();
+        java.time.LocalDateTime startOfWeek = now.minusDays(6).atStartOfDay();
         java.time.YearMonth thisMonth = java.time.YearMonth.from(now);
 
-        long totalDelivered = allOrders.stream().filter(o -> o.getStatus() == DELIVERED).count();
-        java.math.BigDecimal totalSum = allOrders.stream()
-                .filter(o -> o.getStatus() == DELIVERED)
+        var deliveredOrders = allOrders.stream().filter(o -> o.getStatus() == DELIVERED).toList();
+
+        long totalDelivered = deliveredOrders.size();
+        java.math.BigDecimal totalSum = deliveredOrders.stream()
                 .map(Order::getTotalDeliveryPrice)
                 .reduce(java.math.BigDecimal.ZERO, java.math.BigDecimal::add);
 
-        long monthDelivered = allOrders.stream()
-                .filter(o -> o.getStatus() == DELIVERED && o.getDeliveredAt() != null
+        long todayDelivered = deliveredOrders.stream()
+                .filter(o -> o.getDeliveredAt() != null && !o.getDeliveredAt().isBefore(startOfToday))
+                .count();
+        java.math.BigDecimal todaySum = deliveredOrders.stream()
+                .filter(o -> o.getDeliveredAt() != null && !o.getDeliveredAt().isBefore(startOfToday))
+                .map(Order::getTotalDeliveryPrice)
+                .reduce(java.math.BigDecimal.ZERO, java.math.BigDecimal::add);
+
+        long weekDelivered = deliveredOrders.stream()
+                .filter(o -> o.getDeliveredAt() != null && !o.getDeliveredAt().isBefore(startOfWeek))
+                .count();
+        java.math.BigDecimal weekSum = deliveredOrders.stream()
+                .filter(o -> o.getDeliveredAt() != null && !o.getDeliveredAt().isBefore(startOfWeek))
+                .map(Order::getTotalDeliveryPrice)
+                .reduce(java.math.BigDecimal.ZERO, java.math.BigDecimal::add);
+
+        long monthDelivered = deliveredOrders.stream()
+                .filter(o -> o.getDeliveredAt() != null
                         && java.time.YearMonth.from(o.getDeliveredAt()).equals(thisMonth))
                 .count();
-        java.math.BigDecimal monthSum = allOrders.stream()
-                .filter(o -> o.getStatus() == DELIVERED && o.getDeliveredAt() != null
+        java.math.BigDecimal monthSum = deliveredOrders.stream()
+                .filter(o -> o.getDeliveredAt() != null
                         && java.time.YearMonth.from(o.getDeliveredAt()).equals(thisMonth))
                 .map(Order::getTotalDeliveryPrice)
                 .reduce(java.math.BigDecimal.ZERO, java.math.BigDecimal::add);
@@ -1280,6 +1470,8 @@ public class Bot extends TelegramLongPollingBot {
         sb.append("💰 *Моя статистика*\n\n")
                 .append("📦 *Всего доставлено:* ").append(totalDelivered).append(" заказов\n")
                 .append("💵 *Сумма:* ").append(totalSum).append(" ₽\n\n")
+                .append("📆 *Сегодня:* ").append(todayDelivered).append(" заказов, ").append(todaySum).append(" ₽\n")
+                .append("📅 *За 7 дней:* ").append(weekDelivered).append(" заказов, ").append(weekSum).append(" ₽\n")
                 .append("📅 *За ").append(monthName).append(":* ").append(monthDelivered)
                 .append(" заказов, ").append(monthSum).append(" ₽\n\n")
                 .append("💳 *Баланс депозита:* ").append(balance).append(" ₽\n")
@@ -1354,6 +1546,21 @@ public class Bot extends TelegramLongPollingBot {
         rows.add(java.util.List.of(topUpBtn));
         InlineKeyboardMarkup markup = new InlineKeyboardMarkup(rows);
         return new CourierStatsContent(text, markup);
+    }
+
+    /** Редактировать сообщение «Доступные заказы» (для пагинации). */
+    public void editAvailableOrdersMessage(Long chatId, Integer messageId, String text, InlineKeyboardMarkup markup) {
+        EditMessageText edit = new EditMessageText();
+        edit.setChatId(chatId.toString());
+        edit.setMessageId(messageId);
+        edit.setText(text);
+        edit.setParseMode("Markdown");
+        edit.setReplyMarkup(markup);
+        try {
+            execute(edit);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка редактирования списка доступных заказов: chatId={}, messageId={}", chatId, messageId, e);
+        }
     }
 
     /** Редактировать сообщение «Моя статистика» курьера (для пагинации операций депозита). */

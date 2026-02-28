@@ -22,6 +22,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -40,6 +41,7 @@ public class OrderService {
     private final DeliveryPriceService deliveryPriceService;
     private final CourierService courierService;
     private final CourierTransactionService courierTransactionService;
+    private final CourierPenaltyService courierPenaltyService;
 
     /**
      * Создать новый заказ (без координат).
@@ -124,12 +126,16 @@ public class OrderService {
         return orderRepository.findByStatusWithShop(OrderStatus.NEW);
     }
 
+    /** Макс. заказов для загрузки (при 400+ в боте не тянем все в память). */
+    private static final int AVAILABLE_ORDERS_FETCH_LIMIT = 80;
+
     /**
      * Доступные заказы, отсортированные по расстоянию от курьера до магазина (ближайшие сверху).
-     * Заказы без координат магазина — в конце списка.
+     * Загружаем не более 80 — при 400 заказах не тянем все в память.
      */
     public List<Order> getAvailableOrdersSortedByDistanceFrom(double courierLat, double courierLon) {
-        List<Order> list = orderRepository.findByStatusWithShop(OrderStatus.NEW);
+        List<Order> list = orderRepository.findByStatusWithShopOrderByDeliveryDate(
+                OrderStatus.NEW, org.springframework.data.domain.PageRequest.of(0, AVAILABLE_ORDERS_FETCH_LIMIT));
         list.sort(Comparator.comparingDouble(order -> distanceFromCourier(order, courierLat, courierLon)));
         return list;
     }
@@ -159,7 +165,7 @@ public class OrderService {
     /**
      * Доступные заказы с честным распределением: первые nearestCount — ближайшие по гео;
      * следующие otherCount — от магазинов, которым этот курьер доставил меньше всего за последние 24 ч.
-     * Чтобы ни один магазин не был обделён.
+     * Берём до 80 заказов из БД (при 400+ не тянем все).
      */
     public List<Order> getAvailableOrdersWithFairness(double courierLat, double courierLon, User courier, int nearestCount, int otherCount) {
         List<Order> allSorted = getAvailableOrdersSortedByDistanceFrom(courierLat, courierLon);
@@ -210,6 +216,22 @@ public class OrderService {
      */
     public Optional<Order> getOrderWithShop(UUID orderId) {
         return orderRepository.findByIdWithShop(orderId);
+    }
+
+    /**
+     * Заказы с магазином по списку ID (порядок сохраняется).
+     */
+    public List<Order> findByIdsWithShop(List<UUID> ids) {
+        if (ids == null || ids.isEmpty()) return List.of();
+        List<Order> found = orderRepository.findByIdInWithShop(ids);
+        Map<UUID, Order> byId = new HashMap<>();
+        for (Order o : found) byId.put(o.getId(), o);
+        List<Order> result = new ArrayList<>();
+        for (UUID id : ids) {
+            Order o = byId.get(id);
+            if (o != null) result.add(o);
+        }
+        return result;
     }
 
     /**
@@ -306,6 +328,62 @@ public class OrderService {
                 saved.getId(), courier.getFullName(), courier.getId());
 
         return Optional.of(saved);
+    }
+
+    /**
+     * Назначить связку заказов курьеру (2–3 заказа).
+     * Проверяет лимит активных (max 3), баланс на сумму комиссий, назначает по порядку.
+     *
+     * @param orderIds список ID заказов в порядке маршрута
+     * @param courier  курьер (User)
+     * @return список успешно назначенных заказов; пустой при ошибке
+     */
+    @Transactional
+    public List<Order> assignBundleToCourier(List<UUID> orderIds, User courier) {
+        if (orderIds == null || orderIds.isEmpty() || courier == null) {
+            return List.of();
+        }
+        if (orderIds.size() > 3) {
+            log.warn("Связка больше 3 заказов: {}", orderIds.size());
+            return List.of();
+        }
+        long activeCount = countActiveOrdersForCourier(courier);
+        if (activeCount + orderIds.size() > 3) {
+            log.warn("Курьер не может взять связку: активных {}, связка {}", activeCount, orderIds.size());
+            return List.of();
+        }
+        // Считаем общую комиссию
+        BigDecimal totalCommission = BigDecimal.ZERO;
+        List<Order> toAssign = new ArrayList<>();
+        for (UUID id : orderIds) {
+            Optional<Order> opt = orderRepository.findById(id);
+            if (opt.isEmpty() || !opt.get().isAvailable() || opt.get().hasCourier()) {
+                log.warn("Заказ {} недоступен для связки", id);
+                return List.of(); // хотя бы один недоступен — отменяем всю связку
+            }
+            BigDecimal comm = calculateCommissionForCourier(opt.get(), courier);
+            if (comm != null) totalCommission = totalCommission.add(comm);
+            toAssign.add(opt.get());
+        }
+        if (!courierService.chargeFromBalance(courier, totalCommission)) {
+            log.info("Недостаточно баланса для связки: commission={}", totalCommission);
+            return List.of();
+        }
+        List<Order> assigned = new ArrayList<>();
+        for (Order order : toAssign) {
+            BigDecimal comm = calculateCommissionForCourier(order, courier);
+            if (comm != null && comm.compareTo(BigDecimal.ZERO) > 0) {
+                courierService.findByUser(courier).ifPresent(c ->
+                        courierTransactionService.addCommissionCharge(c, order, comm));
+            }
+            order.setCourier(courier);
+            order.setStatus(OrderStatus.ACCEPTED);
+            order.setAcceptedAt(java.time.LocalDateTime.now());
+            orderRepository.save(order);
+            assigned.add(order);
+        }
+        log.info("Связка из {} заказов назначена курьеру {}", assigned.size(), courier.getId());
+        return assigned;
     }
 
     /**
@@ -438,29 +516,37 @@ public class OrderService {
     }
 
     /**
+     * Результат отмены/возврата заказа курьером.
+     * notifyAdmin = курьер был в магазине, но не у получателя по гео — «звоночек» на разбор админу.
+     */
+    public record CancelResult(boolean success, boolean penaltyApplied, boolean notifyAdmin, String penaltyReason) {}
+
+    /**
      * Отмена заказа курьером.
      * Допускается только для активных заказов этого курьера (ACCEPTED / IN_SHOP / PICKED_UP / ON_WAY).
      * Завершённые или чужие заказы отменить нельзя.
+     *
+     * @param cancelReason причина отмены (передаётся админам), может быть null
      */
     @Transactional
-    public boolean cancelOrderByCourier(UUID orderId, User courierUser) {
-        log.info("🛰️ Запрос отмены заказа курьером: orderId={}, courierUserId={}", orderId, courierUser != null ? courierUser.getId() : null);
+    public CancelResult cancelOrderByCourier(UUID orderId, User courierUser, String cancelReason) {
+        log.info("Запрос отмены заказа курьером: orderId={}, courierUserId={}", orderId, courierUser != null ? courierUser.getId() : null);
         Optional<Order> opt = orderRepository.findById(orderId);
         if (opt.isEmpty()) {
             log.warn("🚨 Отмена курьером: заказ не найден, orderId={}", orderId);
-            return false;
+            return new CancelResult(false, false, false, null);
         }
         Order order = opt.get();
         if (order.isCompleted()) {
             log.warn("Курьер пытается отменить завершённый заказ: orderId={}, status={}", orderId, order.getStatus());
-            return false;
+            return new CancelResult(false, false, false, null);
         }
         if (order.getCourier() == null || courierUser == null
                 || order.getCourier().getId() == null
                 || !order.getCourier().getId().equals(courierUser.getId())) {
             log.warn("Курьер пытается отменить не свой заказ: orderId={}, courierId={}",
                     orderId, courierUser != null ? courierUser.getId() : null);
-            return false;
+            return new CancelResult(false, false, false, null);
         }
         OrderStatus status = order.getStatus();
         if (!(status == OrderStatus.ACCEPTED
@@ -468,49 +554,60 @@ public class OrderService {
                 || status == OrderStatus.PICKED_UP
                 || status == OrderStatus.ON_WAY)) {
             log.warn("🚫 Статус заказа не подходит для отмены курьером: orderId={}, status={}", orderId, status);
-            return false;
+            return new CancelResult(false, false, false, null);
         }
         order.setStatus(OrderStatus.CANCELLED);
+        if (cancelReason != null && !cancelReason.isBlank()) {
+            order.setCourierCancelReason(cancelReason.trim());
+        }
         orderRepository.save(order);
         log.info("✅ Заказ отменён курьером: orderId={}, courierUserId={}", orderId, courierUser.getId());
-        // Возврат комиссии на депозит курьера (если заказ отменён без штрафа).
-        Optional<org.example.flower_delivery.model.Courier> courierOpt = courierService.findByUser(courierUser);
-        courierOpt.ifPresent(courier -> {
-            BigDecimal commission = calculateCommissionForCourier(order, courierUser);
-            if (commission != null && commission.compareTo(BigDecimal.ZERO) > 0) {
-                log.info("🔄 Возврат комиссии после отмены: orderId={}, courierId={}, amount={}",
-                        orderId, courier.getId(), commission);
-                courierService.addToBalance(courierUser, commission);
-                courierTransactionService.addCommissionRefund(courier, order, commission);
-            }
-        });
-        return true;
+
+        var penaltyResult = courierPenaltyService.checkAndApplyPenalties(order, courierUser, false);
+        if (penaltyResult.anyApplied()) {
+            log.info("⚠️ Штраф применён при отмене: orderId={}, courierUserId={}, reason={}",
+                    orderId, courierUser.getId(), penaltyResult.reason());
+        } else {
+            Optional<org.example.flower_delivery.model.Courier> courierOpt = courierService.findByUser(courierUser);
+            courierOpt.ifPresent(courier -> {
+                BigDecimal commission = calculateCommissionForCourier(order, courierUser);
+                if (commission != null && commission.compareTo(BigDecimal.ZERO) > 0) {
+                    log.info("Возврат комиссии после отмены: orderId={}, courierId={}, amount={}",
+                            orderId, courier.getId(), commission);
+                    courierService.addToBalance(courierUser, commission);
+                    courierTransactionService.addCommissionRefund(courier, order, commission);
+                }
+            });
+        }
+        return new CancelResult(true, penaltyResult.anyApplied(), penaltyResult.notifyAdmin(), penaltyResult.reason());
     }
 
     /**
      * Возврат заказа в магазин курьером.
      * Допускается только для активных заказов этого курьера (ACCEPTED / IN_SHOP / PICKED_UP / ON_WAY).
      * Завершённые или чужие заказы вернуть нельзя.
+     *
+     * @param cancelReason причина возврата (передаётся админам), может быть null
      */
     @Transactional
-    public boolean returnOrderToShopByCourier(UUID orderId, User courierUser) {
-        log.info("🛰️ Запрос возврата заказа в магазин курьером: orderId={}, courierUserId={}", orderId, courierUser != null ? courierUser.getId() : null);
+    public CancelResult returnOrderToShopByCourier(UUID orderId, User courierUser, String cancelReason) {
+        log.info("Запрос возврата заказа в магазин курьером: orderId={}, courierUserId={}", orderId, courierUser != null ? courierUser.getId() : null);
         Optional<Order> opt = orderRepository.findById(orderId);
         if (opt.isEmpty()) {
             log.warn("🚨 Возврат в магазин: заказ не найден, orderId={}", orderId);
-            return false;
+            return new CancelResult(false, false, false, null);
         }
         Order order = opt.get();
         if (order.isCompleted()) {
             log.warn("Курьер пытается вернуть завершённый заказ: orderId={}, status={}", orderId, order.getStatus());
-            return false;
+            return new CancelResult(false, false, false, null);
         }
         if (order.getCourier() == null || courierUser == null
                 || order.getCourier().getId() == null
                 || !order.getCourier().getId().equals(courierUser.getId())) {
             log.warn("Курьер пытается вернуть не свой заказ: orderId={}, courierId={}",
                     orderId, courierUser != null ? courierUser.getId() : null);
-            return false;
+            return new CancelResult(false, false, false, null);
         }
         OrderStatus status = order.getStatus();
         if (!(status == OrderStatus.ACCEPTED
@@ -518,23 +615,32 @@ public class OrderService {
                 || status == OrderStatus.PICKED_UP
                 || status == OrderStatus.ON_WAY)) {
             log.warn("🚫 Статус заказа не подходит для возврата в магазин: orderId={}, status={}", orderId, status);
-            return false;
+            return new CancelResult(false, false, false, null);
         }
         order.setStatus(OrderStatus.RETURNED);
+        if (cancelReason != null && !cancelReason.isBlank()) {
+            order.setCourierCancelReason(cancelReason.trim());
+        }
         orderRepository.save(order);
         log.info("↩️ Заказ помечен как возвращён в магазин курьером: orderId={}, courierUserId={}", orderId, courierUser.getId());
-        // Возврат комиссии на депозит курьера (если заказ честно возвращён в магазин).
-        Optional<org.example.flower_delivery.model.Courier> courierOpt = courierService.findByUser(courierUser);
-        courierOpt.ifPresent(courier -> {
-            BigDecimal commission = calculateCommissionForCourier(order, courierUser);
-            if (commission != null && commission.compareTo(BigDecimal.ZERO) > 0) {
-                log.info("🔄 Возврат комиссии после возврата в магазин: orderId={}, courierId={}, amount={}",
-                        orderId, courier.getId(), commission);
-                courierService.addToBalance(courierUser, commission);
-                courierTransactionService.addCommissionRefund(courier, order, commission);
-            }
-        });
-        return true;
+
+        var penaltyResult = courierPenaltyService.checkAndApplyPenalties(order, courierUser, true);
+        if (penaltyResult.anyApplied()) {
+            log.info("⚠️ Штраф применён при возврате: orderId={}, courierUserId={}, reason={}",
+                    orderId, courierUser.getId(), penaltyResult.reason());
+        } else {
+            Optional<org.example.flower_delivery.model.Courier> courierOpt = courierService.findByUser(courierUser);
+            courierOpt.ifPresent(courier -> {
+                BigDecimal commission = calculateCommissionForCourier(order, courierUser);
+                if (commission != null && commission.compareTo(BigDecimal.ZERO) > 0) {
+                    log.info("Возврат комиссии после возврата в магазин: orderId={}, courierId={}, amount={}",
+                            orderId, courier.getId(), commission);
+                    courierService.addToBalance(courierUser, commission);
+                    courierTransactionService.addCommissionRefund(courier, order, commission);
+                }
+            });
+        }
+        return new CancelResult(true, penaltyResult.anyApplied(), penaltyResult.notifyAdmin(), penaltyResult.reason());
     }
 
     // ============================================
