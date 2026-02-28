@@ -38,6 +38,8 @@ public class OrderService {
     private final OrderStopRepository orderStopRepository;
     private final GeocodingService geocodingService;
     private final DeliveryPriceService deliveryPriceService;
+    private final CourierService courierService;
+    private final CourierTransactionService courierTransactionService;
 
     /**
      * Создать новый заказ (без координат).
@@ -211,6 +213,42 @@ public class OrderService {
     }
 
     /**
+     * Заказ с магазином, пользователем магазина и курьером (для отправки запроса магазину «Курьер забрал?»).
+     */
+    public Optional<Order> getOrderForShopPickupMessage(UUID orderId) {
+        return orderRepository.findByIdWithShopAndShopUserAndCourier(orderId);
+    }
+
+    /**
+     * Отметить, что магазину отправлен запрос «Курьер забрал заказ?» (при переходе в «В путь»).
+     */
+    @Transactional
+    public void markShopPickupConfirmationRequested(UUID orderId) {
+        orderRepository.findById(orderId).ifPresent(order -> {
+            order.setShopPickupConfirmationRequestedAt(LocalDateTime.now());
+            orderRepository.save(order);
+        });
+    }
+
+    /**
+     * Сохранить ответ магазина на запрос «Курьер забрал заказ?» (ДА/Нет).
+     * Вызывать только если вызывающий — пользователь магазина этого заказа.
+     *
+     * @return true если заказ найден и ответ ещё не был сохранён
+     */
+    @Transactional
+    public boolean setShopPickupConfirmed(UUID orderId, boolean confirmed) {
+        Optional<Order> opt = orderRepository.findByIdWithShop(orderId);
+        if (opt.isEmpty()) return false;
+        Order order = opt.get();
+        if (order.getShopPickupConfirmed() != null) return false; // уже ответил
+        order.setShopPickupConfirmed(confirmed);
+        order.setShopPickupConfirmedAt(LocalDateTime.now());
+        orderRepository.save(order);
+        return true;
+    }
+
+    /**
      * Посчитать количество активных заказов курьера.
      * Активные = в пути / в работе, ещё не завершённые.
      */
@@ -245,7 +283,20 @@ public class OrderService {
                     orderId, order.getStatus(), order.hasCourier());
             return Optional.empty();
         }
-
+        // Рассчитываем комиссию курьера за этот заказ (процент в Courier.commissionPercent)
+        // и пытаемся списать её с баланса.
+        BigDecimal commission = calculateCommissionForCourier(order, courier);
+        if (commission != null && commission.compareTo(BigDecimal.ZERO) > 0) {
+            if (!courierService.chargeFromBalance(courier, commission)) {
+                // Недостаточно средств — заказ брать нельзя.
+                log.info("Курьеру не хватает баланса для комиссии: userId={}, commission={}", courier.getId(), commission);
+                return Optional.empty();
+            } else {
+                // Записываем транзакцию комиссии.
+                courierService.findByUser(courier)
+                        .ifPresent(c -> courierTransactionService.addCommissionCharge(c, order, commission));
+            }
+        }
         order.setCourier(courier);
         order.setStatus(OrderStatus.ACCEPTED);
         order.setAcceptedAt(java.time.LocalDateTime.now());
@@ -309,6 +360,61 @@ public class OrderService {
     }
 
     /**
+     * Рассчитать комиссию курьера за заказ по его проценту.
+     *
+     * @return сумма комиссии или null, если курьер не найден
+     */
+    public BigDecimal calculateCommissionForCourier(Order order, User courier) {
+        if (order == null || courier == null) {
+            return null;
+        }
+        Optional<org.example.flower_delivery.model.Courier> courierOpt = courierService.findByUser(courier);
+        if (courierOpt.isEmpty()) {
+            return null;
+        }
+        // Избегаем LazyInitializationException: для мультиадресных заказов берём сумму точек через репозиторий,
+        // для обычных — просто deliveryPrice из самого заказа.
+        BigDecimal totalPrice;
+        if (order.isMultiStopOrder()) {
+            totalPrice = orderStopRepository.getTotalDeliveryPrice(order.getId());
+        } else {
+            totalPrice = order.getDeliveryPrice();
+        }
+        if (totalPrice == null) {
+            totalPrice = BigDecimal.ZERO;
+        }
+        BigDecimal percent = courierOpt.get().getCommissionPercent() != null
+                ? courierOpt.get().getCommissionPercent()
+                : new BigDecimal("20.00");
+        return totalPrice
+                .multiply(percent)
+                .divide(new BigDecimal("100.00"));
+    }
+
+    /**
+     * Проверить, хватает ли баланса курьера для комиссии по конкретному заказу.
+     * Используется, чтобы показать курьеру понятное сообщение при попытке взять заказ.
+     */
+    public boolean isInsufficientBalanceForOrder(UUID orderId, User courier) {
+        Optional<Order> opt = orderRepository.findById(orderId);
+        if (opt.isEmpty()) {
+            return false;
+        }
+        BigDecimal commission = calculateCommissionForCourier(opt.get(), courier);
+        if (commission == null || commission.compareTo(BigDecimal.ZERO) <= 0) {
+            return false;
+        }
+        Optional<org.example.flower_delivery.model.Courier> courierOpt = courierService.findByUser(courier);
+        if (courierOpt.isEmpty()) {
+            return false;
+        }
+        BigDecimal balance = courierOpt.get().getBalance() != null
+                ? courierOpt.get().getBalance()
+                : BigDecimal.ZERO;
+        return balance.compareTo(commission) < 0;
+    }
+
+    /**
      * Отменить заказ (только со статусом NEW).
      *
      * @param orderId ID заказа
@@ -328,6 +434,106 @@ public class OrderService {
         order.setStatus(OrderStatus.CANCELLED);
         orderRepository.save(order);
         log.info("Заказ отменён: orderId={}", orderId);
+        return true;
+    }
+
+    /**
+     * Отмена заказа курьером.
+     * Допускается только для активных заказов этого курьера (ACCEPTED / IN_SHOP / PICKED_UP / ON_WAY).
+     * Завершённые или чужие заказы отменить нельзя.
+     */
+    @Transactional
+    public boolean cancelOrderByCourier(UUID orderId, User courierUser) {
+        log.info("🛰️ Запрос отмены заказа курьером: orderId={}, courierUserId={}", orderId, courierUser != null ? courierUser.getId() : null);
+        Optional<Order> opt = orderRepository.findById(orderId);
+        if (opt.isEmpty()) {
+            log.warn("🚨 Отмена курьером: заказ не найден, orderId={}", orderId);
+            return false;
+        }
+        Order order = opt.get();
+        if (order.isCompleted()) {
+            log.warn("Курьер пытается отменить завершённый заказ: orderId={}, status={}", orderId, order.getStatus());
+            return false;
+        }
+        if (order.getCourier() == null || courierUser == null
+                || order.getCourier().getId() == null
+                || !order.getCourier().getId().equals(courierUser.getId())) {
+            log.warn("Курьер пытается отменить не свой заказ: orderId={}, courierId={}",
+                    orderId, courierUser != null ? courierUser.getId() : null);
+            return false;
+        }
+        OrderStatus status = order.getStatus();
+        if (!(status == OrderStatus.ACCEPTED
+                || status == OrderStatus.IN_SHOP
+                || status == OrderStatus.PICKED_UP
+                || status == OrderStatus.ON_WAY)) {
+            log.warn("🚫 Статус заказа не подходит для отмены курьером: orderId={}, status={}", orderId, status);
+            return false;
+        }
+        order.setStatus(OrderStatus.CANCELLED);
+        orderRepository.save(order);
+        log.info("✅ Заказ отменён курьером: orderId={}, courierUserId={}", orderId, courierUser.getId());
+        // Возврат комиссии на депозит курьера (если заказ отменён без штрафа).
+        Optional<org.example.flower_delivery.model.Courier> courierOpt = courierService.findByUser(courierUser);
+        courierOpt.ifPresent(courier -> {
+            BigDecimal commission = calculateCommissionForCourier(order, courierUser);
+            if (commission != null && commission.compareTo(BigDecimal.ZERO) > 0) {
+                log.info("🔄 Возврат комиссии после отмены: orderId={}, courierId={}, amount={}",
+                        orderId, courier.getId(), commission);
+                courierService.addToBalance(courierUser, commission);
+                courierTransactionService.addCommissionRefund(courier, order, commission);
+            }
+        });
+        return true;
+    }
+
+    /**
+     * Возврат заказа в магазин курьером.
+     * Допускается только для активных заказов этого курьера (ACCEPTED / IN_SHOP / PICKED_UP / ON_WAY).
+     * Завершённые или чужие заказы вернуть нельзя.
+     */
+    @Transactional
+    public boolean returnOrderToShopByCourier(UUID orderId, User courierUser) {
+        log.info("🛰️ Запрос возврата заказа в магазин курьером: orderId={}, courierUserId={}", orderId, courierUser != null ? courierUser.getId() : null);
+        Optional<Order> opt = orderRepository.findById(orderId);
+        if (opt.isEmpty()) {
+            log.warn("🚨 Возврат в магазин: заказ не найден, orderId={}", orderId);
+            return false;
+        }
+        Order order = opt.get();
+        if (order.isCompleted()) {
+            log.warn("Курьер пытается вернуть завершённый заказ: orderId={}, status={}", orderId, order.getStatus());
+            return false;
+        }
+        if (order.getCourier() == null || courierUser == null
+                || order.getCourier().getId() == null
+                || !order.getCourier().getId().equals(courierUser.getId())) {
+            log.warn("Курьер пытается вернуть не свой заказ: orderId={}, courierId={}",
+                    orderId, courierUser != null ? courierUser.getId() : null);
+            return false;
+        }
+        OrderStatus status = order.getStatus();
+        if (!(status == OrderStatus.ACCEPTED
+                || status == OrderStatus.IN_SHOP
+                || status == OrderStatus.PICKED_UP
+                || status == OrderStatus.ON_WAY)) {
+            log.warn("🚫 Статус заказа не подходит для возврата в магазин: orderId={}, status={}", orderId, status);
+            return false;
+        }
+        order.setStatus(OrderStatus.RETURNED);
+        orderRepository.save(order);
+        log.info("↩️ Заказ помечен как возвращён в магазин курьером: orderId={}, courierUserId={}", orderId, courierUser.getId());
+        // Возврат комиссии на депозит курьера (если заказ честно возвращён в магазин).
+        Optional<org.example.flower_delivery.model.Courier> courierOpt = courierService.findByUser(courierUser);
+        courierOpt.ifPresent(courier -> {
+            BigDecimal commission = calculateCommissionForCourier(order, courierUser);
+            if (commission != null && commission.compareTo(BigDecimal.ZERO) > 0) {
+                log.info("🔄 Возврат комиссии после возврата в магазин: orderId={}, courierId={}, amount={}",
+                        orderId, courier.getId(), commission);
+                courierService.addToBalance(courierUser, commission);
+                courierTransactionService.addCommissionRefund(courier, order, commission);
+            }
+        });
         return true;
     }
 

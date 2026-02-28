@@ -124,6 +124,22 @@ public class Courier {
     @Column(name = "last_location_at")
     private LocalDateTime lastLocationAt;
 
+    /**
+     * Текущий баланс депозита курьера.
+     * Используется для списания комиссий и штрафов (всё хранится в рублях).
+     */
+    @Column(name = "balance", nullable = false, precision = 10, scale = 2)
+    @Builder.Default
+    private BigDecimal balance = BigDecimal.ZERO;
+
+    /**
+     * Процент комиссии с доставки (по умолчанию 20%).
+     * Может быть переопределён админом для конкретного курьера.
+     */
+    @Column(name = "commission_percent", nullable = false, precision = 5, scale = 2)
+    @Builder.Default
+    private BigDecimal commissionPercent = new BigDecimal("20.00");
+
     // Здесь потом можно докинуть:
     // - тип транспорта (пеший, авто, вело),
     // - район работы,

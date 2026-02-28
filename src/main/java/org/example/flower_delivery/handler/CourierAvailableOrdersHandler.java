@@ -186,8 +186,15 @@ public class CourierAvailableOrdersHandler {
 
         var assignResult = orderService.assignOrderToCourier(orderId, courier.getUser());
         if (assignResult.isEmpty()) {
-            send(chatId, "❌ Не удалось взять этот заказ.\n" +
-                    "Возможно, его уже забрал другой курьер или он больше не доступен.");
+            // Проверяем, не упираемся ли в недостаток баланса курьера.
+            if (orderService.isInsufficientBalanceForOrder(orderId, courier.getUser())) {
+                send(chatId, "❌ Не удалось взять этот заказ.\n" +
+                        "Похоже, не хватает денег на депозите для комиссии.\n\n" +
+                        "Пополни депозит и попробуй снова.");
+            } else {
+                send(chatId, "❌ Не удалось взять этот заказ.\n" +
+                        "Возможно, его уже забрал другой курьер или он больше не доступен.");
+            }
             return true;
         }
 

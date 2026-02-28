@@ -186,6 +186,24 @@ public class Order {
     @Column(name = "delivered_at")
     private LocalDateTime deliveredAt;
 
+    /**
+     * Когда отправлен запрос магазину «Курьер забрал заказ? ДА/Нет» (при переходе в «В путь»).
+     */
+    @Column(name = "shop_pickup_confirmation_requested_at")
+    private LocalDateTime shopPickupConfirmationRequestedAt;
+
+    /**
+     * Ответ магазина: true = ДА, false = Нет, null = ещё не ответил.
+     */
+    @Column(name = "shop_pickup_confirmed")
+    private Boolean shopPickupConfirmed;
+
+    /**
+     * Когда магазин нажал ДА или Нет.
+     */
+    @Column(name = "shop_pickup_confirmed_at")
+    private LocalDateTime shopPickupConfirmedAt;
+
     // ============================================
     // МУЛЬТИАДРЕСНАЯ ДОСТАВКА
     // ============================================

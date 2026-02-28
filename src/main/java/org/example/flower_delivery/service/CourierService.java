@@ -43,6 +43,13 @@ import java.util.Optional;
     }
 
     /**
+     * Найти курьера по сущности пользователя.
+     */
+    public Optional<Courier> findByUser(User user) {
+        return courierRepository.findByUser(user);
+    }
+
+    /**
      * Зарегистрировать курьера для уже существующего User.
      * (вызывается из сценария регистрации роли "Курьер").
      */
@@ -99,5 +106,53 @@ import java.util.Optional;
             courierRepository.save(c);
             log.debug("Геолокация курьера обновлена: telegramId={}", telegramId);
         });
+    }
+
+    /**
+     * Списать сумму с баланса курьера (например, комиссия или штраф).
+     *
+     * @return true если баланс был достаточен и списание выполнено, false если курьера нет или денег не хватает
+     */
+    public boolean chargeFromBalance(User courierUser, BigDecimal amount) {
+        if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
+            return true;
+        }
+        Optional<Courier> opt = courierRepository.findByUser(courierUser);
+        if (opt.isEmpty()) {
+            log.warn("Не найден курьер для списания с баланса: userId={}", courierUser.getId());
+            return false;
+        }
+        Courier courier = opt.get();
+        BigDecimal current = courier.getBalance() != null ? courier.getBalance() : BigDecimal.ZERO;
+        if (current.compareTo(amount) < 0) {
+            log.info("Недостаточно средств на балансе курьера: courierId={}, balance={}, required={}",
+                    courier.getId(), current, amount);
+            return false;
+        }
+        courier.setBalance(current.subtract(amount));
+        courierRepository.save(courier);
+        log.info("Списано {} с баланса курьера {} (новый баланс = {})",
+                amount, courier.getId(), courier.getBalance());
+        return true;
+    }
+
+    /**
+     * Пополнить баланс курьера (возврат комиссии, пополнение, отмена штрафа и т.п.).
+     */
+    public void addToBalance(User courierUser, BigDecimal amount) {
+        if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
+            return;
+        }
+        Optional<Courier> opt = courierRepository.findByUser(courierUser);
+        if (opt.isEmpty()) {
+            log.warn("Не найден курьер для пополнения баланса: userId={}", courierUser.getId());
+            return;
+        }
+        Courier courier = opt.get();
+        BigDecimal current = courier.getBalance() != null ? courier.getBalance() : BigDecimal.ZERO;
+        courier.setBalance(current.add(amount));
+        courierRepository.save(courier);
+        log.info("Баланс курьера {} пополнен на {} (новый баланс = {})",
+                courier.getId(), amount, courier.getBalance());
     }
 }

@@ -42,6 +42,10 @@ public interface OrderRepository extends JpaRepository<Order, UUID> {
     @Query("SELECT o FROM Order o LEFT JOIN FETCH o.shop WHERE o.id = :id")
     Optional<Order> findByIdWithShop(@Param("id") UUID id);
 
+    /** Заказ с магазином, пользователем магазина и курьером (для запроса магазину «Курьер забрал?»). */
+    @Query("SELECT o FROM Order o LEFT JOIN FETCH o.shop s LEFT JOIN FETCH s.user LEFT JOIN FETCH o.courier WHERE o.id = :id")
+    Optional<Order> findByIdWithShopAndShopUserAndCourier(@Param("id") UUID id);
+
     //Посчитать заказы магазина:
     long countByShop(Shop shop);
 

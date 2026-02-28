@@ -172,6 +172,8 @@ public class OrderCreationHandler {
         
         data.setDeliveryDate(selectedDate);
         data.setState(OrderCreationState.WAITING_RECIPIENT_NAME);
+        log.info("Магазин выбрал дату доставки: telegramId={}, date={}, label={}",
+                telegramId, selectedDate, dateText);
         
         sendMessage(chatId, "✅ Дата: *" + dateText + "* (" + selectedDate.format(DateTimeFormatter.ofPattern("dd.MM.yyyy")) + ")\n\n" +
                 "Шаг 2 из 6\n" +
@@ -180,11 +182,13 @@ public class OrderCreationHandler {
 
     private void handleRecipientName(Long chatId, Long telegramId, String text, OrderCreationData data) {
         if (text.length() < 2) {
+            log.debug("Магазин прислал слишком короткое имя получателя: telegramId={}, raw='{}'", telegramId, text);
             sendMessage(chatId, "❌ Имя слишком короткое. Введи минимум 2 символа:");
             return;
         }
         data.setRecipientName(text);
         data.setState(OrderCreationState.WAITING_RECIPIENT_PHONE);
+        log.info("Магазин задал имя получателя: telegramId={}, name='{}'", telegramId, text);
 
         sendMessage(chatId, "✅ Получатель: *" + text + "*\n\n" +
                 "Шаг 3 из 6\n" +
@@ -196,11 +200,13 @@ public class OrderCreationHandler {
      */
     private void handleRecipientPhone(Long chatId, Long telegramId, String text, OrderCreationData data) {
         if (text.length() < 5) {
+            log.debug("Магазин прислал странный телефон получателя: telegramId={}, raw='{}'", telegramId, text);
             sendMessage(chatId, "❌ Телефон слишком короткий. Попробуй ещё раз:");
             return;
         }
         data.setRecipientPhone(text);
         data.setState(OrderCreationState.WAITING_DELIVERY_ADDRESS);
+        log.info("Магазин задал телефон получателя: telegramId={}, phone='{}'", telegramId, text);
 
         sendMessage(chatId, "✅ Телефон: *" + text + "*\n\n" +
                 "Шаг 4 из 6\n" +
@@ -221,7 +227,8 @@ public class OrderCreationHandler {
         }
 
         data.setDeliveryAddress(text);
-        
+        log.info("Магазин задал адрес доставки: telegramId={}, address='{}'", telegramId, text);
+
         // Пробуем геокодировать адрес
         sendMessage(chatId, "🔍 Определяю расстояние...");
         

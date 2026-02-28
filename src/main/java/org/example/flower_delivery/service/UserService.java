@@ -8,6 +8,7 @@ import org.example.flower_delivery.repository.UserRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.List;
 import java.util.Optional;
 
 @Service  // Говорит Spring: "Это сервис, создай для него бин!"
@@ -135,6 +136,13 @@ public class UserService {
     public boolean isShop(Long telegramId) {
         Optional<Role> roleOpt = getRoleByTelegramId(telegramId);
         return roleOpt.isPresent() && roleOpt.get() == Role.SHOP;
+    }
+
+    /**
+     * Найти всех активных администраторов.
+     */
+    public List<User> findActiveAdmins() {
+        return userRepository.findByRoleAndIsActiveTrue(Role.ADMIN);
     }
 
     /**
