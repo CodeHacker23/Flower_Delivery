@@ -85,7 +85,7 @@ public class YooKassaPaymentService {
                 log.error("ЮKassa вернула ошибку: status={}, body={}", response.getStatusCode(), response.getBody());
                 return null;
             }
-
+ // проерка ветки рефакторинг просто что бы она на гите появилась
             Object confirmationObj = response.getBody().get("confirmation");
             if (confirmationObj instanceof Map<?, ?> confirmationMap) {
                 Object urlObj = confirmationMap.get("confirmation_url");
