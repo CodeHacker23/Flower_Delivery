@@ -52,10 +52,10 @@ public class OrderService {
                              BigDecimal deliveryPrice,
                              String comment,
                              LocalDate deliveryDate) {
-        return createOrder(shop, recipientName, recipientPhone, deliveryAddress, 
-                deliveryPrice, comment, deliveryDate, null, null);
+        return createOrder(shop, recipientName, recipientPhone, deliveryAddress,
+                deliveryPrice, comment, deliveryDate, null, null, null);
     }
-    
+
     /**
      * Создать новый заказ (с координатами).
      */
@@ -67,6 +67,22 @@ public class OrderService {
                              LocalDate deliveryDate,
                              Double deliveryLatitude,
                              Double deliveryLongitude) {
+        return createOrder(shop, recipientName, recipientPhone, deliveryAddress,
+                deliveryPrice, comment, deliveryDate, deliveryLatitude, deliveryLongitude, null);
+    }
+
+    /**
+     * Создать новый заказ (с координатами и интервалом доставки).
+     */
+    @Transactional
+    public Order createOrder(Shop shop, String recipientName, String recipientPhone,
+                             String deliveryAddress,
+                             BigDecimal deliveryPrice,
+                             String comment,
+                             LocalDate deliveryDate,
+                             Double deliveryLatitude,
+                             Double deliveryLongitude,
+                             org.example.flower_delivery.model.DeliveryInterval deliveryInterval) {
         log.info("Создание заказа: shopId={}, recipient={}, date={}", shop.getId(), recipientName, deliveryDate);
 
         // Создаём заказ через Builder
@@ -78,8 +94,9 @@ public class OrderService {
                 .deliveryPrice(deliveryPrice)
                 .comment(comment)
                 .deliveryDate(deliveryDate)
-                .status(OrderStatus.NEW);
-        
+                .status(OrderStatus.NEW)
+                .deliveryInterval(deliveryInterval);
+
         // Добавляем координаты если есть
         if (deliveryLatitude != null && deliveryLongitude != null) {
             builder.deliveryLatitude(BigDecimal.valueOf(deliveryLatitude));
@@ -141,13 +158,10 @@ public class OrderService {
     }
 
     private static double distanceFromCourier(Order order, double courierLat, double courierLon) {
-        if (order.getShop() == null || order.getShop().getLatitude() == null || order.getShop().getLongitude() == null) {
-            return Double.POSITIVE_INFINITY;
-        }
-        return GeoUtil.distanceKm(
-                courierLat, courierLon,
-                order.getShop().getLatitude().doubleValue(), order.getShop().getLongitude().doubleValue()
-        );
+        BigDecimal lat = order.getEffectivePickupLatitude();
+        BigDecimal lon = order.getEffectivePickupLongitude();
+        if (lat == null || lon == null) return Double.POSITIVE_INFINITY;
+        return GeoUtil.distanceKm(courierLat, courierLon, lat.doubleValue(), lon.doubleValue());
     }
 
     /**
@@ -657,20 +671,22 @@ public class OrderService {
      * @return созданный заказ со всеми точками
      */
     @Transactional
-    public Order createMultiStopOrder(Shop shop, LocalDate deliveryDate, String comment,
+    public Order createMultiStopOrder(Shop shop, LocalDate deliveryDate,
+                                       org.example.flower_delivery.model.DeliveryInterval deliveryInterval,
+                                       String comment,
                                        List<OrderCreationData.StopData> stopsData) {
-        log.info("Создание мультиадресного заказа: shopId={}, stops={}, date={}", 
+        log.info("Создание мультиадресного заказа: shopId={}, stops={}, date={}",
                 shop.getId(), stopsData.size(), deliveryDate);
-        
+
         // Рассчитываем общую стоимость
         BigDecimal totalPrice = stopsData.stream()
                 .map(OrderCreationData.StopData::getDeliveryPrice)
                 .filter(p -> p != null)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
-        
+
         // Берём первую точку для основных данных заказа (для обратной совместимости)
         OrderCreationData.StopData firstStop = stopsData.get(0);
-        
+
         // Создаём заказ
         Order order = Order.builder()
                 .shop(shop)
@@ -680,6 +696,7 @@ public class OrderService {
                 .deliveryPrice(totalPrice)
                 .comment(comment)
                 .deliveryDate(deliveryDate)
+                .deliveryInterval(deliveryInterval)
                 .status(OrderStatus.NEW)
                 .isMultiStop(true)
                 .totalStops(stopsData.size())
@@ -926,15 +943,14 @@ public class OrderService {
      * Пересчитать цену доставки для обычного заказа (1 адрес).
      */
     private void recalcSingleOrderDelivery(Order order) {
-        if (order.getShop() == null ||
-                order.getShop().getLatitude() == null ||
-                order.getShop().getLongitude() == null ||
-                order.getDeliveryLatitude() == null ||
-                order.getDeliveryLongitude() == null) {
+        BigDecimal shopLatBd = order.getEffectivePickupLatitude();
+        BigDecimal shopLonBd = order.getEffectivePickupLongitude();
+        if (shopLatBd == null || shopLonBd == null ||
+                order.getDeliveryLatitude() == null || order.getDeliveryLongitude() == null) {
             return;
         }
-        double shopLat = order.getShop().getLatitude().doubleValue();
-        double shopLon = order.getShop().getLongitude().doubleValue();
+        double shopLat = shopLatBd.doubleValue();
+        double shopLon = shopLonBd.doubleValue();
         double lat = order.getDeliveryLatitude().doubleValue();
         double lon = order.getDeliveryLongitude().doubleValue();
 
@@ -954,15 +970,14 @@ public class OrderService {
         if (stops == null || stops.isEmpty()) {
             return;
         }
-        if (order.getShop() == null ||
-                order.getShop().getLatitude() == null ||
-                order.getShop().getLongitude() == null) {
+        BigDecimal shopLatBd = order.getEffectivePickupLatitude();
+        BigDecimal shopLonBd = order.getEffectivePickupLongitude();
+        if (shopLatBd == null || shopLonBd == null) {
             log.warn("Невозможно пересчитать мультидоставку: у магазина нет координат (orderId={})", order.getId());
             return;
         }
-
-        double shopLat = order.getShop().getLatitude().doubleValue();
-        double shopLon = order.getShop().getLongitude().doubleValue();
+        double shopLat = shopLatBd.doubleValue();
+        double shopLon = shopLonBd.doubleValue();
 
         // Проверяем, что у всех точек есть координаты
         for (OrderStop stop : stops) {

@@ -37,6 +37,14 @@ public class RegionConfig {
     @Value("${app.region.area}")
     private String area;
 
+    /** Слаг города для 2ГИС (chelyabinsk, ekb) — для URL маршрутов. */
+    @Value("${app.region.2gis-city:chelyabinsk}")
+    private String twoGisCity;
+
+    /** Путь города для Яндекс.Карт (74/chelyabinsk — Челябинская обл.) — для URL маршрутов. */
+    @Value("${app.region.yandex-path:74/chelyabinsk}")
+    private String yandexPath;
+
     @PostConstruct
     public void init() {
         log.info("===========================================");

@@ -3,6 +3,7 @@ package org.example.flower_delivery.handler;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.example.flower_delivery.Bot;
+import org.example.flower_delivery.model.Order;
 import org.example.flower_delivery.model.OrderStatus;
 import org.example.flower_delivery.model.Role;
 import org.example.flower_delivery.model.Shop;
@@ -12,7 +13,6 @@ import org.example.flower_delivery.service.UserService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
-import org.example.flower_delivery.model.Order;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
@@ -186,6 +186,10 @@ public class CallbackQueryHandler {
                 // Выбор даты доставки при создании заказа
                 answerCallbackQuery(callbackQuery.getId(), "📅 Дата выбрана");
                 orderCreationHandler.handleDateSelection(telegramId, chatId, callbackData);
+            } else if (callbackData.startsWith("delivery_interval_")) {
+                // Выбор интервала доставки при создании заказа
+                answerCallbackQuery(callbackQuery.getId(), "⏰ Интервал выбран");
+                orderCreationHandler.handleDeliveryIntervalSelection(telegramId, chatId, callbackData);
             } else if (callbackData.startsWith("confirm_price_")) {
                 // Подтверждение автоматически рассчитанной цены
                 String priceStr = callbackData.replace("confirm_price_", "");
@@ -239,10 +243,19 @@ public class CallbackQueryHandler {
                 answerCallbackQuery(callbackQuery.getId(), "🔎 Выбор заказа");
                 myOrdersSelectionHandler.startSelection(telegramId, chatId);
 
-            // ===== КУРЬЕР: ВЫБРАТЬ ЗАКАЗ ИЗ СПИСКА =====
-            } else if (callbackData.equals("courier_orders_select")) {
-                answerCallbackQuery(callbackQuery.getId(), "🔎 Выбор заказа");
-                courierAvailableOrdersHandler.startSelection(telegramId, chatId);
+            // ===== КУРЬЕР: ПРОСМОТР ЗАКАЗА (нажали на кнопку заказа) =====
+            } else if (callbackData.startsWith("courier_order_view:")) {
+                String orderIdStr = callbackData.replace("courier_order_view:", "");
+                answerCallbackQuery(callbackQuery.getId(), "📋 Заказ");
+                handleCourierOrderView(telegramId, chatId, orderIdStr);
+            // ===== КУРЬЕР: ЗАБРАТЬ ЗАКАЗ (из детального просмотра) =====
+            } else if (callbackData.startsWith("courier_order_take:")) {
+                String orderIdStr = callbackData.replace("courier_order_take:", "");
+                answerCallbackQuery(callbackQuery.getId(), "✅ Назначаю заказ...");
+                handleCourierOrderTake(telegramId, chatId, orderIdStr);
+            } else if (callbackData.startsWith("courier_phone:")) {
+                answerCallbackQuery(callbackQuery.getId(), "📞 Телефон");
+                handleCourierPhoneRequest(chatId, callbackData);
             // РЕАЛИЗОВАНО: пагинация «Доступные заказы» — редактируем сообщение
             } else if (callbackData.startsWith("courier_orders_page:")) {
                 String pageStr = callbackData.replace("courier_orders_page:", "");
@@ -535,6 +548,83 @@ public class CallbackQueryHandler {
     }
 
     /**
+     * Показать детали заказа курьеру (нажал на кнопку заказа в списке).
+     */
+    private void handleCourierOrderView(Long telegramId, Long chatId, String orderIdStr) {
+        UUID orderId;
+        try {
+            orderId = UUID.fromString(orderIdStr);
+        } catch (IllegalArgumentException e) {
+            sendMessage(chatId, "❌ Неверный ID заказа.");
+            return;
+        }
+        var orderOpt = orderService.getOrderWithShop(orderId);
+        if (orderOpt.isEmpty()) {
+            sendMessage(chatId, "❌ Заказ не найден.");
+            return;
+        }
+        Order order = orderOpt.get();
+        if (order.getStatus() != OrderStatus.NEW) {
+            sendMessage(chatId, "❌ Этот заказ уже взят другим курьером.");
+            return;
+        }
+        String shopName = order.getShop() != null && order.getShop().getShopName() != null
+                ? order.getShop().getShopName() : "—";
+        String timeRange = order.getDeliveryInterval() != null
+                ? order.getDeliveryInterval().getTimeRange() : "—";
+        StringBuilder sb = new StringBuilder();
+        sb.append("*Заказ ").append(shopName).append("*\n\n");
+        sb.append("👤 *Получатель:* ").append(order.getRecipientName()).append(" (").append(order.getRecipientPhone()).append(")\n");
+        sb.append("📞 *Клиент:* ").append(order.getRecipientPhone()).append("\n");
+        sb.append("📍 *Адрес:* ").append(order.getDeliveryAddress()).append("\n");
+        sb.append("⏰ *Период доставки:* ").append(timeRange).append("\n");
+        sb.append("💬 *Комментарий:* ").append(order.getComment() != null ? order.getComment() : "—").append("\n");
+        sb.append("💰 *Стоимость доставки:* ").append(order.getDeliveryPrice()).append(" руб.");
+        List<InlineKeyboardButton> row1 = new ArrayList<>();
+        row1.add(InlineKeyboardButton.builder().text("📞 Получатель").callbackData("courier_phone:" + orderId + ":recipient").build());
+        row1.add(InlineKeyboardButton.builder().text("📞 Заказчик").callbackData("courier_phone:" + orderId + ":client").build());
+        List<InlineKeyboardButton> row2 = new ArrayList<>();
+        row2.add(InlineKeyboardButton.builder().text("✅ Забрать заказ").callbackData("courier_order_take:" + orderId).build());
+        InlineKeyboardMarkup markup = new InlineKeyboardMarkup(List.of(row1, row2));
+        sendMessage(chatId, sb.toString(), markup);
+    }
+
+    /**
+     * Курьер нажал «Получатель» или «Заказчик» — отправляем телефон для звонка.
+     */
+    private void handleCourierPhoneRequest(Long chatId, String callbackData) {
+        String rest = callbackData.replace("courier_phone:", "");
+        String[] parts = rest.split(":", 2);
+        if (parts.length < 2) return;
+        UUID orderId;
+        try {
+            orderId = UUID.fromString(parts[0]);
+        } catch (IllegalArgumentException e) {
+            return;
+        }
+        var orderOpt = orderService.findById(orderId);
+        if (orderOpt.isEmpty()) return;
+        Order order = orderOpt.get();
+        String phone = order.getRecipientPhone();
+        String label = "recipient".equals(parts[1]) ? "Получатель" : "Заказчик";
+        sendMessage(chatId, "📞 *" + label + ":* " + phone + "\n\n_Нажми на номер, чтобы позвонить._");
+    }
+
+    /**
+     * Курьер нажал «Забрать заказ» — назначаем заказ.
+     */
+    private void handleCourierOrderTake(Long telegramId, Long chatId, String orderIdStr) {
+        UUID orderId;
+        try {
+            orderId = UUID.fromString(orderIdStr);
+        } catch (IllegalArgumentException e) {
+            sendMessage(chatId, "❌ Неверный ID заказа.");
+            return;
+        }
+        courierAvailableOrdersHandler.takeOrderById(telegramId, chatId, orderId);
+    }
+
+    /**
      * Выполнить отмену заказа (после нажатия "Да, отменить").
      */
     private void handleOrderCancelConfirm(Long chatId, String orderIdStr) {
@@ -628,28 +718,33 @@ public class CallbackQueryHandler {
                     "Возможно: заказы уже заняты, превышен лимит (3 активных) или не хватает средств на депозите.");
             return;
         }
-        StringBuilder sb = new StringBuilder();
-        sb.append("✅ *Связка взята!* (").append(assigned.size()).append(" заказов)\n\n");
         List<Order> withShops = new ArrayList<>();
-        for (int i = 0; i < assigned.size(); i++) {
-            Order o = assigned.get(i);
-            var withShop = orderService.getOrderWithShop(o.getId()).orElse(o);
-            withShops.add(withShop);
+        for (Order o : assigned) {
+            withShops.add(orderService.getOrderWithShop(o.getId()).orElse(o));
+        }
+        // Порядок по оптимальному маршруту (забор1→доставка1→забор2→доставка2), чтобы текст и 2ГИС совпадали
+        List<Order> forDisplay = orderBundleService.reorderByOptimalRoute(withShops);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("✅ *Связка взята!* (").append(forDisplay.size()).append(" заказов)\n\n");
+        sb.append("_Порядок ниже = порядок по маршруту (сначала забор, потом доставка, затем следующий забор и т.д.)._\n\n");
+        for (int i = 0; i < forDisplay.size(); i++) {
+            Order o = forDisplay.get(i);
             sb.append(i + 1).append(". ").append(o.getRecipientName()).append(" — ").append(o.getDeliveryAddress()).append("\n");
-            if (withShop.getShop() != null && withShop.getShop().getPickupAddress() != null) {
-                sb.append("   🏪 Забрать: ").append(withShop.getShop().getPickupAddress()).append("\n");
+            if (o.getEffectivePickupAddress() != null) {
+                sb.append("   🏪 Забрать: ").append(o.getEffectivePickupAddress()).append("\n");
             }
         }
         sb.append("\nНажми «🚚 Мои заказы» для смены статусов.");
 
-        // Кнопки маршрута (Яндекс/2ГИС) — только после взятия связки: курьер → магазин → доставки по пути
+        // Кнопки маршрута (Яндекс/2ГИС) — только после взятия связки: курьер → забор1 → доставка1 → забор2 → доставка2
         InlineKeyboardMarkup markup = null;
         var courier = courierOpt.get();
         if (courier.getLastLatitude() != null && courier.getLastLongitude() != null) {
             double lat = courier.getLastLatitude().doubleValue();
             double lon = courier.getLastLongitude().doubleValue();
             Optional<org.example.flower_delivery.service.OrderBundleService.OrderBundle> routeOpt =
-                    orderBundleService.buildRouteForOrders(withShops, lat, lon);
+                    orderBundleService.buildRouteForOrders(forDisplay, lat, lon);
             if (routeOpt.isPresent()) {
                 var bundle = routeOpt.get();
                 List<InlineKeyboardButton> row = List.of(
@@ -792,7 +887,7 @@ public class CallbackQueryHandler {
             answerCallbackQuery(callbackQuery.getId(), "Вы уже ответили на этот запрос");
             return;
         }
-        // Убираем кнопки у исходного сообщения (редактирование может не пройти — не критично)
+        // Редактируем исходное сообщение — убираем кнопки и показываем ответ (одно сообщение, без дублирования)
         try {
             EditMessageText edit = new EditMessageText();
             edit.setChatId(chatId.toString());
@@ -803,11 +898,6 @@ public class CallbackQueryHandler {
         } catch (TelegramApiException e) {
             log.debug("Редактирование сообщения магазину не выполнено (возможно, устаревшее): orderId={}", orderId, e);
         }
-        // Всегда отправляем отдельное сообщение, чтобы магазин точно увидел ответ
-        String replyText = confirmed
-                ? "✅ *Подтверждено.* Вы передали заказ курьеру."
-                : "❌ *Ответ учтён.* Вы указали, что заказ курьеру не передан.";
-        sendMessage(chatId, replyText);
         answerCallbackQuery(callbackQuery.getId(), confirmed ? "✅ Подтверждено" : "Ответ учтён");
     }
 

@@ -702,79 +702,108 @@ public class Bot extends TelegramLongPollingBot {
         }
     }
 
-    /** Текст и клавиатура списка «Доступные заказы». РЕАЛИЗОВАНО: пагинация (page, totalPages), кнопки «← Назад» / «Дальше →». */
+    /** Текст и клавиатура списка «Доступные заказы». Каждый заказ — inline-кнопка. */
     public record AvailableOrdersContent(String text, InlineKeyboardMarkup markup) {}
 
-    public AvailableOrdersContent buildAvailableOrdersContentWithLocation(List<Order> ordersToShow, double courierLat, double courierLon,
-                                                                         int page, int totalPages, int totalCount) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("📋 *Доступные заказы* (от ближайших)\n\n");
+    /** Сократить строку для кнопки. */
+    private static String truncateForButton(String s, int maxLen) {
+        if (s == null || s.isEmpty()) return "—";
+        s = s.trim();
+        if (s.length() <= maxLen) return s;
+        return s.substring(0, maxLen - 1) + ".";
+    }
 
-        // Связки заказов по пути (если есть 2+ заказа с координатами)
-        List<OrderBundleService.OrderBundle> bundles = orderBundleService.findRecommendedBundles(ordersToShow, courierLat, courierLon);
-        if (!bundles.isEmpty()) {
-            sb.append("📦 *Рекомендуемые связки по пути:*\n\n");
-            for (int b = 0; b < bundles.size(); b++) {
-                OrderBundleService.OrderBundle bundle = bundles.get(b);
-                String indicesStr = bundle.indicesInList().stream().map(String::valueOf).reduce((a, b2) -> a + ", " + b2).orElse("");
-                sb.append("• Заказы ").append(indicesStr).append(" — ")
-                        .append(String.format("%.1f", bundle.totalDistanceKm())).append(" км\n");
-            }
-            sb.append("\n");
+    /** Адрес до «улица + дом» — без города, ул., подъезда, квартиры. Для кнопок: "Труда 72", "Тухачевского 10а". */
+    private static String streetAndHouseOnly(String address) {
+        if (address == null || address.isEmpty()) return "—";
+        String s = address.trim();
+        // Обрезаем всё после подъезда, квартиры, домофона
+        int cut = -1;
+        String[] markers = {"подъезд", "подик", "под.", " кв.", " кв ", "квартира", "кв.", "домофон", " д."};
+        String lower = s.toLowerCase();
+        for (String m : markers) {
+            int idx = lower.indexOf(m);
+            if (idx > 0 && (cut < 0 || idx < cut)) cut = idx;
         }
+        if (cut > 0) s = s.substring(0, cut).trim();
+        if (s.endsWith(",")) s = s.substring(0, s.length() - 1).trim();
+        // Убираем префикс города и "ул." — чтобы было "Труда 72", а не "Челябинск, ул. Труда, 72"
+        s = s.replaceFirst("(?i)^челябинск,?\\s*", "");
+        s = s.replaceFirst("(?i)^ул\\.?\\s*", "");
+        s = s.replaceFirst("(?i)^пр\\.?\\s*", "");
+        s = s.replaceFirst("(?i)^проспект\\s+", "");
+        s = s.replace(", ", " ").replace(",", " ").replaceAll("\\s+", " ").trim();
+        return s.isEmpty() ? "—" : s;
+    }
 
-        sb.append("Страница ").append(page + 1).append("/").append(totalPages)
-                .append(" (").append(totalCount).append(" заказов)\n\n");
+    /** Короткий формат времени для кнопки (ASAP → «Срочно», остальные → 09-12). */
+    private static String shortTimeForButton(org.example.flower_delivery.model.DeliveryInterval interval) {
+        if (interval == null) return "—";
+        if (interval == org.example.flower_delivery.model.DeliveryInterval.ASAP) return "Срочно";
+        // 09:00 — 12:00 → 09-12 (компактно для мобильного)
+        String range = interval.getTimeRange().replace(" — ", "-");
+        return range.replace(":00", "").replace(":30", "");
+    }
 
-        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("dd.MM HH:mm");
+    public AvailableOrdersContent buildAvailableOrdersContentWithLocation(List<Order> ordersToShow,
+                                                                         List<Order> fullListForBundles,
+                                                                         double courierLat, double courierLon,
+                                                                         int page, int totalPages, int totalCount) {
+        java.time.LocalDate today = java.time.LocalDate.now();
+        String dateStr = today.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"));
+        StringBuilder sb = new StringBuilder();
+        sb.append("📋 *Список заказов* (").append(page + 1).append("/").append(totalPages)
+                .append(") на ").append(dateStr).append("\n\n")
+                .append("Нажми на заказ, чтобы увидеть детали и взять его.");
+
+        List<OrderBundleService.OrderBundle> bundles = orderBundleService.findRecommendedBundles(
+                fullListForBundles != null && !fullListForBundles.isEmpty() ? fullListForBundles : ordersToShow,
+                courierLat, courierLon);
+        List<List<InlineKeyboardButton>> keyboard = new ArrayList<>();
+
+        // Одна строка — Telegram НЕ поддерживает \n в кнопках. Время коротко (09-12), адреса по возможности целиком
         for (int i = 0; i < ordersToShow.size(); i++) {
             Order order = ordersToShow.get(i);
-            int number = i + 1;
-            sb.append("*").append(number).append(". Заказ*");
-            if (order.getShop() != null && order.getShop().getLatitude() != null && order.getShop().getLongitude() != null) {
-                double km = GeoUtil.distanceKm(courierLat, courierLon,
-                        order.getShop().getLatitude().doubleValue(), order.getShop().getLongitude().doubleValue());
-                sb.append(" — _").append(String.format("%.1f", km)).append(" км_");
-            }
-            sb.append("\n");
-            if (order.getShop() != null) {
-                String pickup = order.getShop().getPickupAddress() != null ? order.getShop().getPickupAddress() : "—";
-                sb.append("   🏪 Забрать: ").append(pickup).append("\n");
-            }
+            int number = page * CourierAvailableOrdersHandler.ORDERS_PER_PAGE + i + 1;
+            String timeStr = shortTimeForButton(order.getDeliveryInterval());
+            String shopAddr = order.getEffectivePickupAddress() != null
+                    ? streetAndHouseOnly(order.getEffectivePickupAddress())
+                    : "—";
+            String deliveryAddr;
             if (order.isMultiStopOrder()) {
-                List<org.example.flower_delivery.model.OrderStop> stops = orderService.getOrderStops(order.getId());
-                if (!stops.isEmpty()) {
-                    for (org.example.flower_delivery.model.OrderStop stop : stops) {
-                        sb.append("   📍 ").append(stop.getRecipientName()).append(" — ").append(stop.getDeliveryAddress()).append("\n");
-                    }
-                } else {
-                    sb.append("   📍 ").append(order.getDeliveryAddress()).append("\n");
-                    sb.append("   👤 ").append(order.getRecipientName()).append(" (").append(order.getRecipientPhone()).append(")\n");
-                }
+                String route = order.getRouteDescription();
+                deliveryAddr = java.util.Arrays.stream(route.split(" → "))
+                        .map(String::trim)
+                        .map(addr -> streetAndHouseOnly(addr))
+                        .reduce((a, b) -> a + "→" + b)
+                        .orElse("—");
             } else {
-                sb.append("   📍 ").append(order.getDeliveryAddress()).append("\n");
-                sb.append("   👤 ").append(order.getRecipientName()).append(" (").append(order.getRecipientPhone()).append(")\n");
+                deliveryAddr = streetAndHouseOnly(order.getDeliveryAddress());
             }
-            sb.append("   💰 ").append(order.getDeliveryPrice()).append("₽\n");
-            if (order.getCreatedAt() != null) {
-                sb.append("   📅 Создан: ").append(order.getCreatedAt().format(fmt)).append("\n");
+            if (shopAddr.length() > 20) shopAddr = truncateForButton(shopAddr, 20);
+            if (deliveryAddr.length() > 20) deliveryAddr = truncateForButton(deliveryAddr, 20);
+            String btnText = "Заказ " + number + " (" + timeStr + ") " + shopAddr + "→" + deliveryAddr;
+            if (btnText.length() > 64) {
+                btnText = btnText.substring(0, 61) + ".";
             }
-            sb.append("\n");
+            keyboard.add(List.of(
+                    InlineKeyboardButton.builder().text(btnText).callbackData("courier_order_view:" + order.getId()).build()
+            ));
         }
 
-        // Кнопки: Взять связку / Альтернативная связка / Выбрать заказ. Маршрут (Яндекс/2ГИС) — только после взятия в «Заказ взят!»
-        List<List<InlineKeyboardButton>> keyboard = new ArrayList<>();
+        // Кнопки связок: индексы 1-based в полном списке (не на странице)
         for (int b = 0; b < bundles.size(); b++) {
             OrderBundleService.OrderBundle bundle = bundles.get(b);
             String indicesStr = String.join(",", bundle.indicesInList().stream().map(String::valueOf).toList());
-            String indicesDisplay = String.join(", ", bundle.indicesInList().stream().map(String::valueOf).toList());
+            List<String> displayNumbers = bundle.indicesInList().stream().map(String::valueOf).toList();
+            String indicesDisplay = String.join(", ", displayNumbers);
             String btnText = (b == 0) ? "📦 Взять связку (" + indicesDisplay + ")" : "📦 Альтернативная связка (" + indicesDisplay + ")";
             keyboard.add(List.of(
                     InlineKeyboardButton.builder().text(btnText).callbackData("courier_bundle_take:" + indicesStr).build()
             ));
         }
-        keyboard.add(List.of(InlineKeyboardButton.builder().text("🔎 Выбрать заказ").callbackData("courier_orders_select").build()));
-        // Пагинация: ← Назад | Дальше →
+
+        // Пагинация
         if (totalPages > 1) {
             List<InlineKeyboardButton> navRow = new ArrayList<>();
             if (page > 0) {
@@ -807,7 +836,7 @@ public class Bot extends TelegramLongPollingBot {
      * если у него больше нет активных заказов.
      */
     public void sendReturnToShopRoute(org.example.flower_delivery.model.Courier courier, Order order) {
-        if (courier == null || order == null || order.getShop() == null) {
+        if (courier == null || order == null) {
             return;
         }
         Long chatId = courier.getUser() != null ? courier.getUser().getTelegramId() : null;
@@ -817,14 +846,14 @@ public class Bot extends TelegramLongPollingBot {
         if (courier.getLastLatitude() == null || courier.getLastLongitude() == null) {
             return;
         }
-        if (order.getShop().getLatitude() == null || order.getShop().getLongitude() == null) {
+        if (order.getEffectivePickupLatitude() == null || order.getEffectivePickupLongitude() == null) {
             return;
         }
 
         double fromLat = courier.getLastLatitude().doubleValue();
         double fromLon = courier.getLastLongitude().doubleValue();
-        double toLat = order.getShop().getLatitude().doubleValue();
-        double toLon = order.getShop().getLongitude().doubleValue();
+        double toLat = order.getEffectivePickupLatitude().doubleValue();
+        double toLon = order.getEffectivePickupLongitude().doubleValue();
 
         String yandexUrl = buildYandexRouteUrl(fromLat, fromLon, toLat, toLon);
         String twoGisUrl = build2GisRouteUrl(fromLat, fromLon, toLat, toLon);
@@ -903,23 +932,41 @@ public class Bot extends TelegramLongPollingBot {
 
     /**
      * Собрать текст и клавиатуру списка «Мои заказы» курьера (для отправки и для редактирования).
+     * Сначала всегда показываем все активные заказы (ACCEPTED/IN_SHOP/ON_WAY), затем добиваем
+     * последними завершёнными (до 6 всего), чтобы активные не «прятались» за последними 6.
      */
     public CourierMyOrdersContent buildCourierMyOrdersContent(Courier courier, List<Order> allOrders) {
-        int max = 6;
-        int fromIndex = Math.max(0, allOrders.size() - max);
-        List<Order> orders = allOrders.subList(fromIndex, allOrders.size());
+        List<Order> active = allOrders.stream()
+                .filter(o -> o.getStatus() == OrderStatus.ACCEPTED || o.getStatus() == OrderStatus.IN_SHOP
+                        || o.getStatus() == OrderStatus.PICKED_UP || o.getStatus() == OrderStatus.ON_WAY)
+                .toList();
+        List<Order> completed = allOrders.stream()
+                .filter(o -> !active.contains(o))
+                .sorted((a, b) -> {
+                    if (a.getCreatedAt() == null && b.getCreatedAt() == null) return 0;
+                    if (a.getCreatedAt() == null) return 1;
+                    if (b.getCreatedAt() == null) return -1;
+                    return b.getCreatedAt().compareTo(a.getCreatedAt());
+                })
+                .toList();
+        int rest = Math.max(0, 6 - active.size());
+        List<Order> orders = new ArrayList<>(active);
+        orders.addAll(completed.stream().limit(rest).toList());
 
         StringBuilder sb = new StringBuilder();
         sb.append("🚚 *Мои заказы (курьер)*\n\n");
-        sb.append("Всего: ").append(allOrders.size())
-                .append(", показаны последние ").append(orders.size()).append("\n\n");
+        sb.append("Всего: ").append(allOrders.size());
+        if (!active.isEmpty()) {
+            sb.append(", активных: ").append(active.size());
+        }
+        sb.append(", показано: ").append(orders.size()).append("\n\n");
 
         DateTimeFormatter fmt = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
         for (int i = 0; i < orders.size(); i++) {
             Order order = orders.get(i);
-            if (order.getShop() != null && order.getShop().getPickupAddress() != null) {
+            if (order.getEffectivePickupAddress() != null) {
                 sb.append("*").append(i + 1).append(". ").append(order.getRecipientName()).append("*\n");
-                sb.append("   🏪 Забрать: ").append(order.getShop().getPickupAddress()).append("\n");
+                sb.append("   🏪 Забрать: ").append(order.getEffectivePickupAddress()).append("\n");
             } else {
                 sb.append("*").append(i + 1).append(". ").append(order.getRecipientName()).append("*\n");
             }
@@ -978,7 +1025,7 @@ public class Bot extends TelegramLongPollingBot {
                 InlineKeyboardButton btn = new InlineKeyboardButton();
                 String shortAddr;
                 if (next == OrderStatus.IN_SHOP && order.getShop() != null) {
-                    shortAddr = shortAddressForButton(order.getShop().getPickupAddress());
+                    shortAddr = shortAddressForButton(order.getEffectivePickupAddress());
                 } else {
                     shortAddr = shortAddressForButton(order.getDeliveryAddress());
                     if (order.isMultiStopOrder()) {

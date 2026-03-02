@@ -242,8 +242,8 @@ public class CourierGeoHandler {
     private double[] getReferenceCoordinatesForPending(PendingGeoConfirmation pending) {
         if (pending.nextStatus == OrderStatus.IN_SHOP) {
             return orderService.getOrderWithShop(pending.orderId)
-                    .filter(o -> o.getShop() != null && o.getShop().getLatitude() != null && o.getShop().getLongitude() != null)
-                    .map(o -> new double[]{o.getShop().getLatitude().doubleValue(), o.getShop().getLongitude().doubleValue()})
+                    .filter(o -> o.getEffectivePickupLatitude() != null && o.getEffectivePickupLongitude() != null)
+                    .map(o -> new double[]{o.getEffectivePickupLatitude().doubleValue(), o.getEffectivePickupLongitude().doubleValue()})
                     .orElse(null);
         }
         if (pending.nextStatus == OrderStatus.DELIVERED) {

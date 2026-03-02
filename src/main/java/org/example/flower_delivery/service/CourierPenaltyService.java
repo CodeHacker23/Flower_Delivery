@@ -137,8 +137,9 @@ public class CourierPenaltyService {
         if (orderWithShop.isEmpty()) return false;
 
         Order o = orderWithShop.get();
-        Shop shop = o.getShop();
-        if (shop == null || shop.getLatitude() == null || shop.getLongitude() == null) {
+        BigDecimal refLat = o.getEffectivePickupLatitude();
+        BigDecimal refLon = o.getEffectivePickupLongitude();
+        if (refLat == null || refLon == null) {
             return false;
         }
 
@@ -147,24 +148,24 @@ public class CourierPenaltyService {
             double lon = s.getCourierLon().doubleValue();
             if (s.getStatus() == OrderStatus.IN_SHOP) {
                 if (!GeoUtil.isWithinRadiusKm(lat, lon,
-                        shop.getLatitude().doubleValue(), shop.getLongitude().doubleValue(),
+                        refLat.doubleValue(), refLon.doubleValue(),
                         GeoUtil.RADIUS_200_M_KM)) {
                     return false;
                 }
             }
             if (s.getStatus() == OrderStatus.DELIVERED) {
-                BigDecimal refLat = o.getDeliveryLatitude();
-                BigDecimal refLon = o.getDeliveryLongitude();
-                if (refLat == null || refLon == null) {
+                BigDecimal delLat = o.getDeliveryLatitude();
+                BigDecimal delLon = o.getDeliveryLongitude();
+                if (delLat == null || delLon == null) {
                     var stops = orderStopRepository.findByOrderIdOrderByStopNumberAsc(o.getId());
                     if (!stops.isEmpty()) {
                         var lastStop = stops.get(stops.size() - 1);
-                        refLat = lastStop.getDeliveryLatitude();
-                        refLon = lastStop.getDeliveryLongitude();
+                        delLat = lastStop.getDeliveryLatitude();
+                        delLon = lastStop.getDeliveryLongitude();
                     }
                 }
-                if (refLat == null || refLon == null) return false;
-                if (!GeoUtil.isWithinRadiusKm(lat, lon, refLat.doubleValue(), refLon.doubleValue(), GeoUtil.RADIUS_200_M_KM)) {
+                if (delLat == null || delLon == null) return false;
+                if (!GeoUtil.isWithinRadiusKm(lat, lon, delLat.doubleValue(), delLon.doubleValue(), GeoUtil.RADIUS_200_M_KM)) {
                     return false;
                 }
             }

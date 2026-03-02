@@ -6,6 +6,7 @@ import org.example.flower_delivery.Bot;
 import org.example.flower_delivery.model.Order;
 import org.example.flower_delivery.model.OrderStop;
 import org.example.flower_delivery.service.CourierService;
+import org.example.flower_delivery.service.OrderBundleService;
 import org.example.flower_delivery.service.OrderService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
@@ -42,6 +43,7 @@ public class CourierAvailableOrdersHandler {
 
     private final OrderService orderService;
     private final CourierService courierService;
+    private final OrderBundleService orderBundleService;
 
     @Autowired
     @Lazy
@@ -126,7 +128,12 @@ public class CourierAvailableOrdersHandler {
         List<UUID> pageIds = ids.subList(from, to);
         List<Order> ordersToShow = orderService.findByIdsWithShop(pageIds);
 
-        var content = bot.buildAvailableOrdersContentWithLocation(ordersToShow, loc[0], loc[1],
+        // Для связок — полный список (до 20 заказов), чтобы искать лучшие маршруты по всему списку
+        int bundleListSize = Math.min(20, ids.size());
+        List<UUID> bundleIds = ids.subList(0, bundleListSize);
+        List<Order> fullListForBundles = orderService.findByIdsWithShop(bundleIds);
+
+        var content = bot.buildAvailableOrdersContentWithLocation(ordersToShow, fullListForBundles, loc[0], loc[1],
                 page, totalPages, ids.size());
         try {
             if (messageId != null) {
@@ -163,20 +170,92 @@ public class CourierAvailableOrdersHandler {
         lastAvailableCourierLocation.put(telegramId, new double[]{lat, lon});
     }
 
-    /** Получить ID заказов по индексам из списка (индексы 1-based на текущей странице). */
+    /** Получить ID заказов по индексам (индексы 1-based в полном списке «Доступные заказы»). */
     public List<UUID> getOrderIdsForIndices(Long telegramId, List<Integer> indices) {
         List<UUID> ids = lastAvailableOrderIdsByUser.get(telegramId);
         if (ids == null || ids.isEmpty()) return List.of();
-        int page = lastAvailableOrdersPageByUser.getOrDefault(telegramId, 0);
-        int offset = page * ORDERS_PER_PAGE;
         List<UUID> result = new ArrayList<>();
         for (int idx : indices) {
-            int globalIdx = offset + (idx - 1);
+            int globalIdx = idx - 1; // 1-based в полном списке
             if (globalIdx >= 0 && globalIdx < ids.size()) {
                 result.add(ids.get(globalIdx));
             }
         }
         return result;
+    }
+
+    /**
+     * Взять заказ по ID (при нажатии «Забрать заказ» в детальном просмотре).
+     */
+    public boolean takeOrderById(Long telegramId, Long chatId, UUID orderId) {
+        var orderOpt = orderService.findById(orderId);
+        if (orderOpt.isEmpty()) {
+            send(chatId, "❌ Заказ не найден.\nПопробуй снова через «📋 Доступные заказы».");
+            return false;
+        }
+        var courierOpt = courierService.findByTelegramId(telegramId);
+        if (courierOpt.isEmpty()) {
+            send(chatId, "❌ У тебя нет активного профиля курьера.");
+            return false;
+        }
+        var courier = courierOpt.get();
+        if (!Boolean.TRUE.equals(courier.getIsActive())) {
+            send(chatId, "⏳ Твой профиль курьера ещё не активирован.");
+            return false;
+        }
+        var assignResult = orderService.assignOrderToCourier(orderId, courier.getUser());
+        if (assignResult.isEmpty()) {
+            if (orderService.isInsufficientBalanceForOrder(orderId, courier.getUser())) {
+                send(chatId, "❌ Не хватает денег на депозите для комиссии.\nПополни депозит и попробуй снова.");
+            } else {
+                send(chatId, "❌ Не удалось взять заказ.\nВозможно, его уже забрал другой курьер.");
+            }
+            return false;
+        }
+        Order order = assignResult.get();
+        Order orderWithShop = orderService.getOrderWithShop(order.getId()).orElse(order);
+        StringBuilder sb = new StringBuilder();
+        sb.append("✅ *Заказ взят!*\n\n");
+        if (orderWithShop.getEffectivePickupAddress() != null) {
+            sb.append("🏪 *Забрать:* ").append(orderWithShop.getEffectivePickupAddress()).append("\n");
+        }
+        if (orderWithShop.isMultiStopOrder()) {
+            var stops = orderService.getOrderStops(orderWithShop.getId());
+            if (!stops.isEmpty()) {
+                for (OrderStop stop : stops) {
+                    sb.append("📍 ").append(stop.getRecipientName()).append(" — ").append(stop.getDeliveryAddress())
+                            .append(" (").append(stop.getRecipientPhone()).append(")\n");
+                }
+            } else {
+                sb.append("📍 ").append(orderWithShop.getDeliveryAddress()).append("\n");
+                sb.append("👤 ").append(orderWithShop.getRecipientName()).append(" (").append(orderWithShop.getRecipientPhone()).append(")\n");
+            }
+        } else {
+            sb.append("📍 Адрес: ").append(orderWithShop.getDeliveryAddress()).append("\n");
+            sb.append("👤 Получатель: ").append(orderWithShop.getRecipientName())
+                    .append(" (").append(orderWithShop.getRecipientPhone()).append(")\n");
+        }
+        sb.append("💰 Оплата: ").append(orderWithShop.getDeliveryPrice()).append("₽\n");
+        if (orderWithShop.getDeliveryDate() != null) {
+            sb.append("📅 Дата: ").append(orderWithShop.getDeliveryDate()).append("\n");
+        }
+        if (courier.getLastLatitude() != null && courier.getLastLongitude() != null) {
+            double fromLat = courier.getLastLatitude().doubleValue();
+            double fromLon = courier.getLastLongitude().doubleValue();
+            var routeOpt = orderBundleService.buildRouteForSingleOrder(orderWithShop, fromLat, fromLon);
+            if (routeOpt.isPresent()) {
+                var urls = routeOpt.get();
+                InlineKeyboardButton yandexBtn = InlineKeyboardButton.builder().text("🌍 Яндекс.Карты").url(urls.yandexUrl()).build();
+                InlineKeyboardButton twoGisBtn = InlineKeyboardButton.builder().text("🗺 2ГИС").url(urls.twoGisUrl()).build();
+                InlineKeyboardMarkup markup = new InlineKeyboardMarkup(List.of(List.of(yandexBtn, twoGisBtn)));
+                send(chatId, sb.toString(), markup);
+            } else {
+                send(chatId, sb.toString());
+            }
+        } else {
+            send(chatId, sb.toString());
+        }
+        return true;
     }
 
     /** Начать процесс выбора заказа (после нажатия inline-кнопки "Выбрать заказ"). */
@@ -293,8 +372,8 @@ public class CourierAvailableOrdersHandler {
         if (displayNumber != null) {
             sb.append("📋 Номер в списке: `").append(displayNumber).append("`\n");
         }
-        if (orderWithShop.getShop() != null && orderWithShop.getShop().getPickupAddress() != null) {
-            sb.append("🏪 *Забрать:* ").append(orderWithShop.getShop().getPickupAddress()).append("\n");
+        if (orderWithShop.getEffectivePickupAddress() != null) {
+            sb.append("🏪 *Забрать:* ").append(orderWithShop.getEffectivePickupAddress()).append("\n");
         }
         if (orderWithShop.isMultiStopOrder()) {
             var stops = orderService.getOrderStops(orderWithShop.getId());
@@ -317,42 +396,30 @@ public class CourierAvailableOrdersHandler {
             sb.append("📅 Дата доставки: ").append(orderWithShop.getDeliveryDate()).append("\n");
         }
 
-        // Кнопки «Яндекс.Карты» и «2ГИС» — маршрут до магазина
-        if (orderWithShop.getShop() != null
-                && orderWithShop.getShop().getLatitude() != null
-                && orderWithShop.getShop().getLongitude() != null
-                && courier.getLastLatitude() != null
-                && courier.getLastLongitude() != null) {
+        // Кнопки «Яндекс» и «2ГИС» — маршрут из 3 точек: курьер → забор → доставка
+        if (courier.getLastLatitude() != null && courier.getLastLongitude() != null) {
             double fromLat = courier.getLastLatitude().doubleValue();
             double fromLon = courier.getLastLongitude().doubleValue();
-            double toLat = orderWithShop.getShop().getLatitude().doubleValue();
-            double toLon = orderWithShop.getShop().getLongitude().doubleValue();
-            String yandexUrl = buildYandexRouteUrl(fromLat, fromLon, toLat, toLon);
-            String twoGisUrl = build2GisRouteUrl(fromLat, fromLon, toLat, toLon);
-            InlineKeyboardButton yandexBtn = InlineKeyboardButton.builder()
-                    .text("🌍 Яндекс")
-                    .url(yandexUrl)
-                    .build();
-            InlineKeyboardButton twoGisBtn = InlineKeyboardButton.builder()
-                    .text("🗺 2ГИС")
-                    .url(twoGisUrl)
-                    .build();
-            InlineKeyboardMarkup markup = new InlineKeyboardMarkup(List.of(List.of(yandexBtn, twoGisBtn)));
-            send(chatId, sb.toString(), markup);
+            var routeOpt = orderBundleService.buildRouteForSingleOrder(orderWithShop, fromLat, fromLon);
+            if (routeOpt.isPresent()) {
+                var urls = routeOpt.get();
+                InlineKeyboardButton yandexBtn = InlineKeyboardButton.builder()
+                        .text("🌍 Яндекс")
+                        .url(urls.yandexUrl())
+                        .build();
+                InlineKeyboardButton twoGisBtn = InlineKeyboardButton.builder()
+                        .text("🗺 2ГИС")
+                        .url(urls.twoGisUrl())
+                        .build();
+                InlineKeyboardMarkup markup = new InlineKeyboardMarkup(List.of(List.of(yandexBtn, twoGisBtn)));
+                send(chatId, sb.toString(), markup);
+            } else {
+                send(chatId, sb.toString());
+            }
         } else {
             send(chatId, sb.toString());
         }
         return true;
-    }
-
-    private static String buildYandexRouteUrl(double fromLat, double fromLon, double toLat, double toLon) {
-        return "https://yandex.ru/maps/?rtext=" + fromLat + "," + fromLon + "~" + toLat + "," + toLon + "&rtt=auto";
-    }
-
-    private static String build2GisRouteUrl(double fromLat, double fromLon, double toLat, double toLon) {
-        // 2ГИС routeSearch: только точка Б (магазин), точка А = GPS пользователя. Формат to/lon,lat (документация)
-        String to = toLon + "," + toLat;
-        return "https://2gis.ru/routeSearch/rsType/car/to/" + to;
     }
 
     private void send(Long chatId, String text) {

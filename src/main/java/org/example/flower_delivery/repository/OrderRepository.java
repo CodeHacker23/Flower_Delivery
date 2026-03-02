@@ -47,8 +47,8 @@ public interface OrderRepository extends JpaRepository<Order, UUID> {
     @Query("SELECT o FROM Order o LEFT JOIN FETCH o.shop WHERE o.id = :id")
     Optional<Order> findByIdWithShop(@Param("id") UUID id);
 
-    /** Несколько заказов с магазином (для пагинации списка «Доступные заказы»). */
-    @Query("SELECT o FROM Order o LEFT JOIN FETCH o.shop WHERE o.id IN :ids")
+    /** Несколько заказов с магазином и stops (для пагинации «Доступные заказы» — getRouteDescription не падает с LazyInit). */
+    @Query("SELECT DISTINCT o FROM Order o LEFT JOIN FETCH o.shop LEFT JOIN FETCH o.stops WHERE o.id IN :ids")
     List<Order> findByIdInWithShop(@Param("ids") List<UUID> ids);
 
     /** Заказ с магазином, пользователем магазина и курьером (для запроса магазину «Курьер забрал?»). */

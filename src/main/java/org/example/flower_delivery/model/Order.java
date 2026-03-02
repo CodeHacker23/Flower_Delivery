@@ -40,6 +40,19 @@ public class Order {
     @JoinColumn(name = "shop_id", nullable = false)
     private Shop shop;
 
+    // ========== ТОЛЬКО ДЛЯ ТЕСТИРОВАНИЯ МАРШРУТОВ ==========
+    // В продакшене: 1 аккаунт магазина = 1 адрес забора (shop.pickup_address).
+    // Override позволяет симулировать разные точки забора у одного магазина,
+    // чтобы проверить, как OSRM строит связки. В проде эти поля должны быть NULL.
+    @Column(name = "shop_pickup_address_override", length = 500)
+    private String shopPickupAddressOverride;
+
+    @Column(name = "shop_pickup_latitude", precision = 10, scale = 8)
+    private BigDecimal shopPickupLatitude;
+
+    @Column(name = "shop_pickup_longitude", precision = 11, scale = 8)
+    private BigDecimal shopPickupLongitude;
+
     /**
      * Курьер, выполняющий заказ.
      * <p>
@@ -147,6 +160,14 @@ public class Order {
     @Column(name = "delivery_date", nullable = false)
     private LocalDate deliveryDate;
 
+    /**
+     * Интервал доставки (с HH:MM - до HH:MM).
+     * Магазин выбирает при создании заказа.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "delivery_interval", length = 20)
+    private DeliveryInterval deliveryInterval;
+
     // ============================================
     // ВРЕМЕННЫЕ МЕТКИ
     // ============================================
@@ -248,6 +269,31 @@ public class Order {
     // ============================================
     // ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
     // ============================================
+
+    /**
+     * Эффективный адрес забора: override если задан (тест), иначе shop.pickup_address.
+     * В продакшене всегда shop.pickup_address (override = null).
+     */
+    public String getEffectivePickupAddress() {
+        if (shopPickupAddressOverride != null && !shopPickupAddressOverride.isBlank()) {
+            return shopPickupAddressOverride;
+        }
+        return shop != null ? shop.getPickupAddress() : null;
+    }
+
+    /**
+     * Эффективные координаты забора: override если заданы (тест), иначе shop.
+     * В продакшене всегда shop.latitude/longitude.
+     */
+    public BigDecimal getEffectivePickupLatitude() {
+        if (shopPickupLatitude != null) return shopPickupLatitude;
+        return shop != null ? shop.getLatitude() : null;
+    }
+
+    public BigDecimal getEffectivePickupLongitude() {
+        if (shopPickupLongitude != null) return shopPickupLongitude;
+        return shop != null ? shop.getLongitude() : null;
+    }
 
     /**
      * Проверить, назначен ли курьер.
@@ -368,7 +414,7 @@ public class Order {
      * Пример: "Ленина 15 → Ленина 17 → Труда 10"
      */
     public String getRouteDescription() {
-        if (stops == null || stops.isEmpty()) {
+        if (totalStops == null || totalStops <= 1 || stops == null || stops.isEmpty()) {
             return deliveryAddress;
         }
         return stops.stream()

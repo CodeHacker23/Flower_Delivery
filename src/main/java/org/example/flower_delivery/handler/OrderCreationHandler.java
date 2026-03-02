@@ -18,6 +18,7 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMa
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
+import org.example.flower_delivery.model.DeliveryInterval;
 import org.example.flower_delivery.model.Order;
 import org.example.flower_delivery.model.Shop;
 
@@ -25,6 +26,7 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -158,12 +160,61 @@ public class OrderCreationHandler {
         }
         
         data.setDeliveryDate(selectedDate);
-        data.setState(OrderCreationState.WAITING_RECIPIENT_NAME);
+        data.setState(OrderCreationState.WAITING_DELIVERY_INTERVAL);
         log.info("Магазин выбрал дату доставки: telegramId={}, date={}, label={}",
                 telegramId, selectedDate, dateText);
 
-        sendMessage(chatId, "✅ Дата: *" + dateText + "* (" + selectedDate.format(DateTimeFormatter.ofPattern("dd.MM.yyyy")) + ")\n\n" +
-                "Шаг 4 из 6\n" +
+        sendMessageWithIntervalButtons(chatId, "✅ Дата: *" + dateText + "* (" + selectedDate.format(DateTimeFormatter.ofPattern("dd.MM.yyyy")) + ")\n\n" +
+                "Шаг 4 из 7\n" +
+                "Выберите *интервал доставки*:");
+    }
+
+    /**
+     * Отправить сообщение с кнопками выбора интервала доставки.
+     */
+    private void sendMessageWithIntervalButtons(Long chatId, String text) {
+        List<InlineKeyboardButton> row1 = new ArrayList<>();
+        row1.add(InlineKeyboardButton.builder().text("🌅 Утро (09:00-12:00)").callbackData("delivery_interval_MORNING").build());
+        row1.add(InlineKeyboardButton.builder().text("☀️ День (12:00-18:00)").callbackData("delivery_interval_DAY").build());
+        List<InlineKeyboardButton> row2 = new ArrayList<>();
+        row2.add(InlineKeyboardButton.builder().text("🌙 Вечер (18:00-21:00)").callbackData("delivery_interval_EVENING").build());
+        row2.add(InlineKeyboardButton.builder().text("🚀 Срочно").callbackData("delivery_interval_ASAP").build());
+
+        InlineKeyboardMarkup keyboard = new InlineKeyboardMarkup(List.of(row1, row2));
+        SendMessage message = new SendMessage();
+        message.setChatId(chatId.toString());
+        message.setText(text);
+        message.setParseMode("Markdown");
+        message.setReplyMarkup(keyboard);
+        try {
+            bot.execute(message);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки сообщения с интервалом: chatId={}", chatId, e);
+        }
+    }
+
+    /**
+     * Обработка выбора интервала доставки (из callback).
+     */
+    public void handleDeliveryIntervalSelection(Long telegramId, Long chatId, String callbackData) {
+        OrderCreationData data = dataMap.get(telegramId);
+        if (data == null || data.getState() != OrderCreationState.WAITING_DELIVERY_INTERVAL) {
+            return;
+        }
+        DeliveryInterval interval;
+        try {
+            String intervalStr = callbackData.replace("delivery_interval_", "");
+            interval = DeliveryInterval.valueOf(intervalStr);
+        } catch (IllegalArgumentException e) {
+            log.warn("Неизвестный интервал: {}", callbackData);
+            return;
+        }
+        data.setDeliveryInterval(interval);
+        data.setState(OrderCreationState.WAITING_RECIPIENT_NAME);
+        log.info("Магазин выбрал интервал доставки: telegramId={}, interval={}", telegramId, interval);
+
+        sendMessage(chatId, "✅ Интервал: *" + interval.getTimeRange() + "*\n\n" +
+                "Шаг 5 из 7\n" +
                 "Введите *имя получателя*:");
     }
 
@@ -178,7 +229,7 @@ public class OrderCreationHandler {
         log.info("Магазин задал имя получателя: telegramId={}, name='{}'", telegramId, text);
 
         sendMessage(chatId, "✅ Получатель: *" + text + "*\n\n" +
-                "Шаг 5 из 6\n" +
+                "Шаг 6 из 7\n" +
                 "Введите *телефон получателя*:");
     }
 
@@ -196,7 +247,7 @@ public class OrderCreationHandler {
         log.info("Магазин задал телефон получателя: telegramId={}, phone='{}'", telegramId, text);
 
         sendMessage(chatId, "✅ Телефон: *" + text + "*\n\n" +
-                "Шаг 6 из 6\n" +
+                "Шаг 7 из 7\n" +
                 "Введите *комментарий* к доставке\n" +
                 "_Пример: домофон 123, позвонить за 10 мин_\n\n" +
                 "или отправьте /skip чтобы пропустить:");
@@ -841,10 +892,11 @@ public class OrderCreationHandler {
                     data.getComment(),
                     data.getDeliveryDate(),
                     stop.getDeliveryLatitude(),
-                    stop.getDeliveryLongitude()
+                    stop.getDeliveryLongitude(),
+                    data.getDeliveryInterval()
             );
         }
-        
+
         // Иначе из полей
         return orderService.createOrder(
                 shop,
@@ -855,7 +907,8 @@ public class OrderCreationHandler {
                 data.getComment(),
                 data.getDeliveryDate(),
                 data.getDeliveryLatitude(),
-                data.getDeliveryLongitude()
+                data.getDeliveryLongitude(),
+                data.getDeliveryInterval()
         );
     }
     
@@ -866,6 +919,7 @@ public class OrderCreationHandler {
         return orderService.createMultiStopOrder(
                 shop,
                 data.getDeliveryDate(),
+                data.getDeliveryInterval(),
                 data.getComment(),
                 data.getStops()
         );

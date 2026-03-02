@@ -28,6 +28,9 @@ public class OrderCreationData {
     
     /** Дата доставки (сегодня или завтра) */
     private LocalDate deliveryDate;
+
+    /** Интервал доставки (с HH:MM - до HH:MM) */
+    private DeliveryInterval deliveryInterval;
     
     /** Комментарий к заказу (общий) */
     private String comment;
