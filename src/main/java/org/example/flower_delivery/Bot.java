@@ -19,7 +19,6 @@ import org.example.flower_delivery.service.OrderService;
 import org.example.flower_delivery.service.ShopService;
 import org.example.flower_delivery.service.UserService;
 import org.example.flower_delivery.service.CourierTransactionService;
-import org.example.flower_delivery.util.GeoUtil;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
@@ -152,6 +151,14 @@ public class Bot extends TelegramLongPollingBot {
         } catch (Exception e) {
             log.error("Ошибка при обработке update: telegramId={}", telegramId, e);
         }
+    }
+
+    /**
+     * Точка входа для текстовых апдейтов из {@code TextUpdateHandler}.
+     * В текущей версии {@code Bot} вся логика текстов живёт внутри {@link #processUpdate(Update)}.
+     */
+    public void processTextUpdate(Update update) {
+        processUpdate(update);
     }
 
     private void processUpdate(Update update) {

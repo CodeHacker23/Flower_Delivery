@@ -1,15 +1,32 @@
 package org.example.flower_delivery;
 
 import lombok.extern.slf4j.Slf4j;
+import org.example.flower_delivery.telegram.BotTelegramSender;
+import org.example.flower_delivery.telegram.TelegramSender;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
 import org.telegram.telegrambots.meta.TelegramBotsApi;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
 
+import java.util.concurrent.Executor;
+
 @Slf4j
 @Configuration
 public class Config {
+
+    /**
+     * Бин «отправителя» сообщений в Telegram.
+     * Нужен для хендлеров/сервисов, которые шлют сообщения через TelegramSender.
+     */
+    @Bean
+    TelegramSender telegramSender(@Lazy Bot bot,
+                                   @Qualifier("telegramExecutor") Executor telegramExecutor) {
+        return new BotTelegramSender(bot, telegramExecutor);
+    }
+
     /**
      * Регистрирует Telegram-бота как Spring-бин
      *
