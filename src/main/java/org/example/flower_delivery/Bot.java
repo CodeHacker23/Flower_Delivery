@@ -1,5 +1,6 @@
 package org.example.flower_delivery;
 
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.example.flower_delivery.handler.CallbackQueryHandler;
@@ -21,6 +22,7 @@ import org.example.flower_delivery.service.UserService;
 import org.example.flower_delivery.service.CourierTransactionService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import org.telegram.telegrambots.bots.DefaultBotOptions;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
@@ -33,6 +35,7 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.Keyboard
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
 import java.time.LocalDateTime;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -66,6 +69,24 @@ public class Bot extends TelegramLongPollingBot {
     
     @Value("${telegram.bot.username}")
     private String botUsername;
+
+    @Value("${app.telegram.proxy.enabled:false}")
+    private boolean proxyEnabled;
+
+    @Value("${app.telegram.proxy.type:https}")
+    private String proxyType;
+
+    @Value("${app.telegram.proxy.host:}")
+    private String proxyHost;
+
+    @Value("${app.telegram.proxy.port:0}")
+    private int proxyPort;
+
+    @Value("${app.telegram.proxy.username:}")
+    private String proxyUsername;
+
+    @Value("${app.telegram.proxy.password:}")
+    private String proxyPassword;
     
     // Инжектируем обработчик команды /start (Spring автоматически подставит!)
     private final StartCommandHandler startCommandHandler;
@@ -122,6 +143,49 @@ public class Bot extends TelegramLongPollingBot {
     private final Map<Long, PendingCancelReason> awaitingCancelReason = new ConcurrentHashMap<>();
 
     private record PendingCancelReason(UUID orderId, boolean isReturn) {}
+
+    @PostConstruct
+    private void configureBotProxyOptions() {
+        if (!proxyEnabled || proxyHost == null || proxyHost.isBlank() || proxyPort <= 0) {
+            return;
+        }
+        DefaultBotOptions options = getOptions();
+        if (options == null) {
+            log.warn("Bot proxy setup: getOptions() вернул null, прокси не применен.");
+            return;
+        }
+
+        String normalizedType = proxyType == null ? "https" : proxyType.trim().toLowerCase();
+        switch (normalizedType) {
+            case "socks", "socks5" -> options.setProxyType(DefaultBotOptions.ProxyType.SOCKS5);
+            case "http", "https" -> options.setProxyType(DefaultBotOptions.ProxyType.HTTP);
+            default -> {
+                log.warn("Bot proxy setup: неизвестный тип '{}', использую HTTP.", normalizedType);
+                options.setProxyType(DefaultBotOptions.ProxyType.HTTP);
+            }
+        }
+
+        options.setProxyHost(proxyHost);
+        options.setProxyPort(proxyPort);
+        applyProxyCredentialsIfSupported(options);
+        log.info("Bot proxy options configured: type={}, host={}, port={}",
+                options.getProxyType(), proxyHost, proxyPort);
+    }
+
+    private void applyProxyCredentialsIfSupported(DefaultBotOptions options) {
+        if (proxyUsername == null || proxyUsername.isBlank()) {
+            return;
+        }
+        try {
+            Method setProxyUsername = options.getClass().getMethod("setProxyUsername", String.class);
+            setProxyUsername.invoke(options, proxyUsername);
+            Method setProxyPassword = options.getClass().getMethod("setProxyPassword", String.class);
+            setProxyPassword.invoke(options, proxyPassword == null ? "" : proxyPassword);
+            log.info("Bot proxy credentials configured in DefaultBotOptions.");
+        } catch (Exception e) {
+            log.warn("DefaultBotOptions не поддерживает proxy credentials API: {}", e.getMessage());
+        }
+    }
     
     /**
      * Метод который вызывается КАЖДЫЙ РАЗ когда приходит новое сообщение/команда/кнопка

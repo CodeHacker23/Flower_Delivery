@@ -14,9 +14,13 @@ version = '0.0.1-SNAPSHOT'
 description = 'Flower_Delivery'
 
 java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(17)
-    }
+    // Не фиксируем toolchain жестко, чтобы сборка работала и на VPS, и на Windows.
+    // target bytecode оставляем на Java 17 (через --release).
+}
+
+tasks.withType(org.gradle.api.tasks.compile.JavaCompile).configureEach {
+    // Генерируем совместимый байткод (даже если компилируем JDK 21).
+    options.release = 17
 }
 
 configurations {
