@@ -76,19 +76,26 @@ public class RoleCallbackHandler {
                 shopRegistrationHandler.startRegistrationFromCallback(ctx.telegramId(), ctx.chatId());
             } else if (selectedRole == Role.COURIER) {
                 var courierOpt = courierService.findByTelegramId(ctx.telegramId());
+                log.info("Выбор роли курьера: telegramId={}, courierExists={}",
+                        ctx.telegramId(), courierOpt.isPresent());
                 if (courierOpt.isPresent()) {
                     if (Boolean.TRUE.equals(courierOpt.get().getIsActive())) {
+                        log.info("Курьер уже активен: telegramId={}, courierId={}",
+                                ctx.telegramId(), courierOpt.get().getId());
                         ctx.responder().sendMessage(ctx.chatId(), "✅ Ты уже зарегистрирован как курьер.\n\n" +
                                 "Вот твоё меню курьера ниже.", "Markdown", null);
                         menuKeyboardService.sendCourierMenu(ctx.chatId(), "🚴 *Меню курьера*");
                     } else {
+                        log.info("Курьер уже создан, но не активен: telegramId={}, courierId={}",
+                                ctx.telegramId(), courierOpt.get().getId());
                         ctx.responder().sendMessage(ctx.chatId(), "⏳ Ты уже зарегистрирован как курьер.\n\n" +
                                 "Профиль ждёт активации администратором. После активации ты сможешь брать заказы.", "Markdown", null);
                     }
                 } else {
                     ctx.responder().sendMessage(ctx.chatId(), "✅ Отлично! Ты выбрал роль: *Курьер*.\n\n" +
                             "Сейчас зарегистрируем тебя как курьера.\n" +
-                            "Нажми кнопку ниже и поделись номером телефона.", "Markdown", null);
+                            "Сначала напиши своё имя и фамилию.", "Markdown", null);
+                    log.info("Запускаем сценарий регистрации курьера: telegramId={}", ctx.telegramId());
                     courierRegistrationHandler.startRegistrationFromCallback(ctx.telegramId(), ctx.chatId(), null);
                 }
             }

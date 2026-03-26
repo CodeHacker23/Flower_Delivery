@@ -48,16 +48,22 @@ public class AdminTestCommandHandler {
     public void handleActivateCourierCommand(Update update) {
         Long telegramId = update.getMessage().getFrom().getId();
         Long chatId = update.getMessage().getChatId();
+        log.info("Тестовая команда /k: telegramId={}, chatId={}", telegramId, chatId);
         var courierOptional = courierService.findByTelegramId(telegramId);
         if (courierOptional.isEmpty()) {
+            log.warn("Тестовая команда /k: курьер не найден для telegramId={}", telegramId);
             sendSimpleMessage(chatId, "❌ У тебя ещё нет регистрации курьера.\nСначала выбери роль *Курьер* через /start.");
             return;
         }
         var courier = courierOptional.get();
         if (Boolean.TRUE.equals(courier.getIsActive())) {
+            log.info("Тестовая команда /k: курьер уже активен, courierId={}, telegramId={}",
+                    courier.getId(), telegramId);
             menuKeyboardService.sendCourierMenu(chatId, "✅ Твой профиль курьера уже активирован.\n\nМожешь смотреть доступные заказы и свою статистику.");
             return;
         }
+        log.info("Тестовая команда /k: активируем курьера courierId={}, telegramId={}",
+                courier.getId(), telegramId);
         courierService.activateCourier(courier);
         menuKeyboardService.sendCourierMenu(chatId, "✅ *Профиль курьера активирован!*\n\nТеперь ты можешь выбирать заказы и работать курьером.");
     }

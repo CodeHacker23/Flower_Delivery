@@ -65,6 +65,8 @@ public class CourierRegistrationHandler {
         CourierRegistrationData data = new CourierRegistrationData();
         data.setState(CourierRegistrationState.WAITING_FULL_NAME);
         registrationDataMap.put(telegramId, data);
+        log.info("Сценарий регистрации курьера запущен: telegramId={}, state={}",
+                telegramId, data.getState());
 
         // Спрашиваем имя и фамилию
         sendSimpleMessage(chatId,
@@ -89,6 +91,9 @@ public class CourierRegistrationHandler {
             return false;
         }
 
+        log.info("Регистрация курьера: получен текст telegramId={}, state={}, text='{}'",
+                telegramId, data.getState(), preview(text));
+
         if (data.getState() == CourierRegistrationState.WAITING_FULL_NAME) {
             // Валидация имени
             if (text.length() < 3) {
@@ -102,6 +107,8 @@ public class CourierRegistrationHandler {
 
             data.setFullName(text);
             data.setState(CourierRegistrationState.WAITING_PHONE);
+            log.info("Регистрация курьера: ФИО сохранено telegramId={}, nextState={}",
+                    telegramId, data.getState());
 
             // Просим номер телефона через кнопку контакта
             sendMessageWithContactButton(chatId,
@@ -150,6 +157,8 @@ public class CourierRegistrationHandler {
 
         data.setPhone(phone);
         data.setState(CourierRegistrationState.WAITING_PASSPORT_PHOTO);
+        log.info("Регистрация курьера: телефон сохранён telegramId={}, nextState={}",
+                telegramId, data.getState());
 
         try {
             // Убираем клавиатуру и просим селфи с паспортом
@@ -282,5 +291,12 @@ public class CourierRegistrationHandler {
         } catch (TelegramApiException e) {
             log.error("Ошибка отправки сообщения: chatId={}", chatId, e);
         }
+    }
+
+    private String preview(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text.length() <= 80 ? text : text.substring(0, 80) + "...";
     }
 }
