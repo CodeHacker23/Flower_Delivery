@@ -1,0 +1,17 @@
+[Unit]
+Description=Flower Delivery Bot
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/Flower_Delivery
+ExecStart=/usr/bin/java -Xms256m -Xmx1024m -jar /opt/Flower_Delivery/build/libs/Flower_Delivery-0.0.1-SNAPSHOT.jar --spring.config.additional-location=file:/opt/Flower_Delivery/application.properties
+Restart=always
+RestartSec=5
+User=root
+StandardOutput=append:/opt/Flower_Delivery/bot.log
+StandardError=append:/opt/Flower_Delivery/bot.log
+
+[Install]
+WantedBy=multi-user.target
