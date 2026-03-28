@@ -6,9 +6,9 @@ package org.example.flower_delivery.model;
  * Каждый шаг — это один вопрос от бота.
  * Юзер отвечает → переходим на следующий шаг.
  * 
- * ФЛОУ ДЛЯ ОБЫЧНОГО ЗАКАЗА (1 точка):
- * DELIVERY_DATE → RECIPIENT_NAME → RECIPIENT_PHONE → 
- * DELIVERY_ADDRESS → PRICE_CONFIRMATION → COMMENT → CONFIRMATION
+ * ФЛОУ ДЛЯ ОБЫЧНОГО ЗАКАЗА (1 точка, адрес первым по ТЗ):
+ * DELIVERY_ADDRESS → PRICE_CONFIRMATION/DELIVERY_PRICE → DELIVERY_DATE →
+ * RECIPIENT_NAME → RECIPIENT_PHONE → COMMENT → CONFIRMATION
  * 
  * ФЛОУ ДЛЯ МУЛЬТИАДРЕСНОГО ЗАКАЗА (2+ точек):
  * ... → PRICE_CONFIRMATION → ASK_ADDITIONAL_STOP → 
@@ -25,6 +25,9 @@ public enum OrderCreationState {
 
     /** Ждём дату доставки (сегодня/завтра) */
     WAITING_DELIVERY_DATE,
+
+    /** Ждём интервал доставки (с HH:MM - до HH:MM) */
+    WAITING_DELIVERY_INTERVAL,
 
     // ============================================
     // ПЕРВАЯ ТОЧКА (основная)

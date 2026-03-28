@@ -10,6 +10,7 @@ import org.example.flower_delivery.repository.UserRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -30,6 +31,7 @@ public class ShopService {
 
         private final ShopRepository shopRepository;
         private final UserRepository userRepository;
+        private final GeocodingService geocodingService;
 
     /**
      * Найти магазин по пользователю.
@@ -86,6 +88,13 @@ public class ShopService {
                 .isActive(false) // по умолчанию магазин не активен
                 .build();
 
+        // 3.1 Геокодируем адрес забора (для сортировки «ближайшие» и ссылки «Маршрут до магазина»)
+        geocodingService.geocode(pickupAddress).ifPresent(geo -> {
+            shop.setLatitude(BigDecimal.valueOf(geo.latitude()));
+            shop.setLongitude(BigDecimal.valueOf(geo.longitude()));
+            log.debug("Координаты магазина установлены: {}, {}", geo.latitude(), geo.longitude());
+        });
+
         // 4. Сохраняем в БД
         Shop saved = shopRepository.save(shop);
         log.info("Магазин создан: shopId={}, userId={}", saved.getId(), user.getId());
@@ -101,32 +110,3 @@ public class ShopService {
         return shopRepository.save(shop);
     }
 }
-
-
-
-
-
-
-
-
-
-
- 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -5,39 +5,41 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.example.flower_delivery.config.RegionConfig;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.*;
 import org.springframework.http.converter.StringHttpMessageConverter;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
- * Сервис геокодирования через DaData API (Подсказки).
+ * Сервис геокодирования через DaData.
  * <p>
- * Что делает:
- * 1. Принимает адрес текстом: "ул. Ленина 44"
- * 2. Добавляет город из конфига: "Челябинск, ул. Ленина 44"
- * 3. Отправляет в DaData → получает координаты [lat, lon]
+ * Сначала вызывается API стандартизации (Clean) — он нормализует адрес и возвращает
+ * координаты, лучше подходит для автоматической обработки. Если секретный ключ не задан
+ * или Clean не вернул координаты — fallback на API подсказок (Suggest) с ограничением по городу.
  * <p>
- * DaData бесплатно: 10 000 запросов/день
- * Используем API подсказок (suggestions) — требует только API-ключ!
- * Документация: https://dadata.ru/api/suggest/address/
+ * Для адресов магазинов важно вводить адрес точно (улица и номер дома).
+ * Документация: https://dadata.ru/api/clean/address/ и https://dadata.ru/api/suggest/address/
  */
 @Slf4j
 @Service
 public class GeocodingService {
 
-    // API подсказок — работает только с API-ключом (без секретного)
-    private static final String DADATA_URL = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/address";
-    
+    private static final String DADATA_CLEAN_URL = "https://cleaner.dadata.ru/api/v1/clean/address";
+    private static final String DADATA_SUGGEST_URL = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/address";
+
     private final RegionConfig regionConfig;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final RestTemplate restTemplate;
 
     @Value("${dadata.api-key}")
     private String apiKey;
+
+    @Value("${dadata.secret-key:}")
+    private String secretKey;
     
     public GeocodingService(RegionConfig regionConfig) {
         this.regionConfig = regionConfig;
@@ -60,139 +62,178 @@ public class GeocodingService {
 
     /**
      * Геокодировать адрес.
+     * Сначала пробуем API стандартизации (Clean) — точнее для автоматической обработки.
+     * При отсутствии secret-key или при неудаче — fallback на API подсказок (Suggest).
      *
      * @param address Адрес от пользователя (например: "ул. Ленина 44, кв. 15")
      * @return Optional с координатами, или empty если не удалось
      */
     public Optional<GeocodingResult> geocode(String address) {
+        String cleanAddress = cleanAddressForGeocoding(address);
+        String fullAddress = regionConfig.enrichAddress(cleanAddress);
+        log.debug("Геокодирование адреса: {}", fullAddress);
+
+        if (secretKey != null && !secretKey.isBlank()) {
+            Optional<GeocodingResult> cleanResult = geocodeWithClean(fullAddress);
+            if (cleanResult.isPresent()) return cleanResult;
+            log.debug("DaData Clean не вернул координаты, пробуем Suggest");
+        }
+        return geocodeWithSuggest(fullAddress);
+    }
+
+    /**
+     * API стандартизации DaData (clean/address) — нормализует адрес и возвращает координаты.
+     * Требует dadata.secret-key. Ответ: массив объектов с result, geo_lat, geo_lon, qc_geo, city, region.
+     */
+    private Optional<GeocodingResult> geocodeWithClean(String fullAddress) {
         try {
-            // Убираем подъезд и квартиру — DaData их не понимает
-            String cleanAddress = cleanAddressForGeocoding(address);
-            
-            // Добавляем город к адресу
-            String fullAddress = regionConfig.enrichAddress(cleanAddress);
-            log.info("=== DADATA GEOCODING ===");
-            log.info("Адрес для геокодирования: {}", fullAddress);
-            log.info("API Key (первые 10 символов): {}...", apiKey.substring(0, Math.min(10, apiKey.length())));
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL(DADATA_CLEAN_URL).openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            conn.setRequestProperty("Accept", "application/json");
+            conn.setRequestProperty("Authorization", "Token " + apiKey);
+            conn.setRequestProperty("X-Secret", secretKey);
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
 
-            // Формируем запрос к DaData (API подсказок)
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(new MediaType("application", "json", StandardCharsets.UTF_8));
-            headers.setAcceptCharset(java.util.List.of(StandardCharsets.UTF_8));
-            headers.set("Authorization", "Token " + apiKey);
-            // API подсказок НЕ требует X-Secret!
+            // Тело: массив из одного адреса
+            String body = objectMapper.writeValueAsString(List.of(fullAddress));
+            try (java.io.OutputStream os = conn.getOutputStream()) {
+                os.write(body.getBytes(StandardCharsets.UTF_8));
+                os.flush();
+            }
 
-            // Используем HttpURLConnection для полного контроля над кодировкой
-            log.info("DaData URL: {}", DADATA_URL);
-            
-            java.net.URL url = new java.net.URL(DADATA_URL);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            int code = conn.getResponseCode();
+            String responseStr = readResponseBody(conn, code);
+            if (responseStr == null) return Optional.empty();
+
+            JsonNode root = objectMapper.readTree(responseStr);
+            if (!root.isArray() || root.size() == 0) {
+                log.debug("DaData Clean вернул пустой массив");
+                return Optional.empty();
+            }
+            JsonNode first = root.get(0);
+            if (first == null || first.isNull()) return Optional.empty();
+
+            String geoLatStr = getTextOrEmpty(first, "geo_lat");
+            String geoLonStr = getTextOrEmpty(first, "geo_lon");
+            if (geoLatStr.isEmpty() || geoLonStr.isEmpty()) {
+                log.debug("DaData Clean: нет координат в ответе");
+                return Optional.empty();
+            }
+            double lat = Double.parseDouble(geoLatStr);
+            double lon = Double.parseDouble(geoLonStr);
+            String resultAddress = getTextOrEmpty(first, "result");
+            if (resultAddress.isEmpty()) resultAddress = fullAddress;
+            String city = getTextOrEmpty(first, "city");
+            String region = getTextOrEmpty(first, "region");
+
+            // Только наш город: иначе DaData может вернуть, например, Копейск для "Цвиллинга 45"
+            String ourCity = regionConfig.getCity();
+            if (!city.isEmpty() && ourCity != null && !ourCity.isBlank()
+                    && !city.trim().equalsIgnoreCase(ourCity.trim())) {
+                log.warn("DaData Clean вернул другой город: {} (ожидаем {}), адрес {} — пропускаем, будет Suggest",
+                        city, ourCity, fullAddress);
+                return Optional.empty();
+            }
+
+            String qcGeo = getTextOrEmpty(first, "qc_geo");
+            if (!qcGeo.isEmpty()) {
+                try {
+                    if (Integer.parseInt(qcGeo) >= 2) {
+                        log.warn("DaData Clean: неточные координаты (qc_geo={}) для {}", qcGeo, fullAddress);
+                    }
+                } catch (NumberFormatException ignored) { }
+            }
+            log.debug("Геокодирование (Clean) успешно: lat={}, lon={}", lat, lon);
+            return Optional.of(new GeocodingResult(lat, lon, resultAddress, city, region));
+        } catch (Exception e) {
+            log.debug("DaData Clean ошибка: {}", e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * API подсказок DaData (suggest/address) с ограничением по городу. Fallback при отключённом или неудачном Clean.
+     */
+    private Optional<GeocodingResult> geocodeWithSuggest(String fullAddress) {
+        try {
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL(DADATA_SUGGEST_URL).openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
             conn.setRequestProperty("Accept", "application/json");
             conn.setRequestProperty("Authorization", "Token " + apiKey);
             conn.setDoOutput(true);
-            
-            // Формируем JSON и отправляем как UTF-8 bytes
-            String jsonQuery = "{\"query\":\"" + fullAddress.replace("\"", "\\\"") + "\",\"count\":1}";
-            byte[] jsonBytes = jsonQuery.getBytes(StandardCharsets.UTF_8);
-            
-            log.info("DaData request (UTF-8 bytes length): {}", jsonBytes.length);
-            log.info("DaData request JSON: {}", jsonQuery);
-            
+
+            Map<String, Object> body = new java.util.HashMap<>();
+            body.put("query", fullAddress);
+            body.put("count", 1);
+            body.put("locations", List.of(Map.of("city", regionConfig.getCity())));
+            String jsonQuery = objectMapper.writeValueAsString(body);
             try (java.io.OutputStream os = conn.getOutputStream()) {
-                os.write(jsonBytes);
+                os.write(jsonQuery.getBytes(StandardCharsets.UTF_8));
                 os.flush();
             }
-            
-            int responseCode = conn.getResponseCode();
-            log.info("DaData response code: {}", responseCode);
-            
-            // Читаем ответ
-            StringBuilder responseBody = new StringBuilder();
-            try (java.io.BufferedReader br = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    responseBody.append(line);
-                }
-            }
-            
-            String responseStr = responseBody.toString();
-            log.info("DaData response body: {}", responseStr);
 
-            if (responseCode != 200 || responseStr.isEmpty()) {
-                log.error("DaData вернул ошибку: status={}", responseCode);
+            int responseCode = conn.getResponseCode();
+            String responseStr = readResponseBody(conn, responseCode);
+            if (responseStr == null) {
+                log.error("DaData Suggest: ошибка status={}", responseCode);
                 return Optional.empty();
             }
 
-            // Парсим ответ API подсказок
             JsonNode root = objectMapper.readTree(responseStr);
             JsonNode suggestions = root.get("suggestions");
-            
             if (suggestions == null || !suggestions.isArray() || suggestions.size() == 0) {
                 log.warn("DaData не нашёл адрес: {}", fullAddress);
                 return Optional.empty();
             }
-            
             JsonNode firstSuggestion = suggestions.get(0);
             JsonNode data = firstSuggestion.get("data");
-            
             if (data == null) {
                 log.warn("DaData вернул пустые данные для адреса: {}", fullAddress);
                 return Optional.empty();
             }
-            
-            // Проверяем что координаты есть
             JsonNode geoLat = data.get("geo_lat");
             JsonNode geoLon = data.get("geo_lon");
-            
-            if (geoLat == null || geoLon == null || 
-                geoLat.isNull() || geoLon.isNull() ||
-                geoLat.asText().isEmpty() || geoLon.asText().isEmpty()) {
+            if (geoLat == null || geoLon == null || geoLat.isNull() || geoLon.isNull()
+                    || geoLat.asText().isEmpty() || geoLon.asText().isEmpty()) {
                 log.warn("DaData не нашёл координаты для адреса: {}", fullAddress);
                 return Optional.empty();
             }
-
             double lat = Double.parseDouble(geoLat.asText());
             double lon = Double.parseDouble(geoLon.asText());
-            
-            // Извлекаем город и область для валидации
+            String qcGeo = getTextOrEmpty(data, "qc_geo");
+            if (!qcGeo.isEmpty()) {
+                try {
+                    if (Integer.parseInt(qcGeo) >= 2) {
+                        log.warn("DaData вернул неточные координаты (qc_geo={}): {} — проверьте адрес.", qcGeo, fullAddress);
+                    }
+                } catch (NumberFormatException ignored) { }
+            }
             String city = getTextOrEmpty(data, "city");
             String region = getTextOrEmpty(data, "region");
             String resultAddress = getTextOrEmpty(firstSuggestion, "value");
-
-            log.info("Геокодирование успешно: lat={}, lon={}, city={}, region={}", 
-                    lat, lon, city, region);
-
+            log.debug("Геокодирование (Suggest) успешно: lat={}, lon={}", lat, lon);
             return Optional.of(new GeocodingResult(lat, lon, resultAddress, city, region));
-
-        } catch (org.springframework.web.client.HttpClientErrorException e) {
-            log.error("=== DADATA HTTP ERROR ===");
-            log.error("Status: {}", e.getStatusCode());
-            log.error("Response: {}", e.getResponseBodyAsString());
-            log.error("Message: {}", e.getMessage());
-            return Optional.empty();
         } catch (Exception e) {
-            log.error("=== DADATA EXCEPTION ===");
-            log.error("Тип ошибки: {}", e.getClass().getName());
-            log.error("Сообщение: {}", e.getMessage());
-            log.error("Stack trace:", e);
+            log.warn("Ошибка геокодирования (Suggest): {}", e.getMessage());
             return Optional.empty();
         }
     }
-    
-    /**
-     * Экранировать строку для JSON.
-     */
-    private String escapeJson(String text) {
-        return text.replace("\\", "\\\\")
-                   .replace("\"", "\\\"")
-                   .replace("\n", "\\n")
-                   .replace("\r", "\\r")
-                   .replace("\t", "\\t");
-    }
 
+    private String readResponseBody(java.net.HttpURLConnection conn, int responseCode) throws java.io.IOException {
+        if (responseCode != 200) return null;
+        StringBuilder sb = new StringBuilder();
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line);
+        }
+        return sb.toString();
+    }
+    
     /**
      * Очистить адрес для геокодирования — убрать подъезд и квартиру.
      * DaData не понимает "п2 кв 25", ему нужен только адрес до дома.
@@ -213,7 +254,7 @@ public class GeocodingService {
         // Убираем лишние пробелы и запятые в конце
         clean = clean.replaceAll("[,\\s]+$", "").trim();
         
-        log.info("Адрес очищен: '{}' → '{}'", address, clean);
+        log.debug("Адрес очищен: '{}' → '{}'", address, clean);
         return clean;
     }
 

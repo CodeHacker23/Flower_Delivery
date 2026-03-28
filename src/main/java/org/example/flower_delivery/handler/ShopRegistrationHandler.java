@@ -259,6 +259,14 @@ public class ShopRegistrationHandler {
     }
 
     /**
+     * Отменить регистрацию магазина для пользователя (используется при /start и т.п.).
+     */
+    public void cancelRegistration(Long telegramId) {
+        registrationDataMap.remove(telegramId);
+        log.info("Регистрация магазина отменена: telegramId={}", telegramId);
+    }
+
+    /**
      * Отменить регистрацию (если юзер передумал).
      */
     public void cancelRegistration(Long telegramId, Long chatId) {

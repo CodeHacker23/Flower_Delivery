@@ -106,6 +106,7 @@ public class MyOrdersSelectionHandler {
             try {
                 orderId = UUID.fromString(text.trim());
             } catch (IllegalArgumentException e) {
+                log.warn("Магазин накосячил с выбором заказа: telegramId={}, raw='{}'", telegramId, text);
                 send(chatId, "❌ Не удалось распознать номер или ID заказа.\n" +
                         "Введи число от 1 до " + ids.size() + " или корректный UUID.");
                 return true;
@@ -114,11 +115,13 @@ public class MyOrdersSelectionHandler {
 
         var orderOpt = orderService.findById(orderId);
         if (orderOpt.isEmpty()) {
+            log.warn("Магазин выбрал несуществующий заказ: telegramId={}, orderId={}", telegramId, orderId);
             send(chatId, "❌ Заказ с таким ID не найден.\nПопробуй снова через «📋 Мои заказы».");
             return true;
         }
 
         Order order = orderOpt.get();
+        log.info("Магазин открыл карточку заказа: telegramId={}, orderId={}", telegramId, order.getId());
 
         // Попробуем восстановить \"человеческий\" номер из списка (1..N),
         // чтобы в карточке показывать ID как \"10\", а не UUID.

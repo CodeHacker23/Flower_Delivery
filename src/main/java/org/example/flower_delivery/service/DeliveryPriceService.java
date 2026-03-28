@@ -41,13 +41,6 @@ public class DeliveryPriceService {
     private static final double ROAD_DISTANCE_COEFFICIENT = 1.6;
     
     /**
-     * Корректирующий коэффициент для OSRM.
-     * OSRM строит оптимальный маршрут, а 2GIS учитывает реальные объезды.
-     * Эмпирически: OSRM занижает на 15-25% для дальних расстояний.
-     */
-    private static final double OSRM_CORRECTION_COEFFICIENT = 1.2;
-
-    /**
      * Тарифная сетка: км -> цена.
      * TreeMap для автоматической сортировки по ключу.
      */
@@ -76,7 +69,7 @@ public class DeliveryPriceService {
             }
         }
         
-        log.info("Загружено {} тарифов: {}", tariffs.size(), tariffs);
+        log.debug("Загружено {} тарифов", tariffs.size());
         
         if (tariffs.isEmpty()) {
             // Дефолтные тарифы если конфиг пустой
@@ -186,7 +179,7 @@ public class DeliveryPriceService {
         
         String description = String.format("%.1f км — %s₽", roundedDistance, price);
         
-        log.info("Расчёт доставки: {} км = {}₽", roundedDistance, price);
+        log.debug("Расчёт доставки: {} км = {}₽", roundedDistance, price);
         
         return new DeliveryCalculation(roundedDistance, price, description);
     }
@@ -249,7 +242,7 @@ public class DeliveryPriceService {
             double coefficient = calculateOsrmCoefficient(distanceKm);
             double correctedDistance = distanceKm * coefficient;
             
-            log.info("OSRM расстояние: {} км × {} = {} км", 
+            log.debug("OSRM расстояние: {} км × {} = {} км", 
                     String.format("%.1f", distanceKm), 
                     String.format("%.2f", coefficient),
                     String.format("%.1f", correctedDistance));
@@ -290,6 +283,14 @@ public class DeliveryPriceService {
      */
     public BigDecimal getMinPrice() {
         return tariffs.isEmpty() ? new BigDecimal("300") : tariffs.firstEntry().getValue();
+    }
+
+    /**
+     * Минимальная цена по тарифной сетке для данного расстояния.
+     * Используется при ручном вводе цены магазином — нельзя ставить меньше тарифа.
+     */
+    public BigDecimal getMinPriceForDistance(double distanceKm) {
+        return getPriceByDistance(distanceKm);
     }
 
     /**
@@ -353,7 +354,7 @@ public class DeliveryPriceService {
         
         String description = String.format("➕ +%.1f км — %s₽", roundedDistance, price);
         
-        log.info("Расчёт доп. точки: {} км = {}₽", roundedDistance, price);
+        log.debug("Расчёт доп. точки: {} км = {}₽", roundedDistance, price);
         
         return new DeliveryCalculation(roundedDistance, price, description);
     }
@@ -394,8 +395,7 @@ public class DeliveryPriceService {
             prices[i] = additional.price();
         }
         
-        log.info("Мультиадресная доставка: {} точек, цены: {}", 
-                stops.length, java.util.Arrays.toString(prices));
+        log.debug("Мультиадресная доставка: {} точек", stops.length);
         
         return prices;
     }

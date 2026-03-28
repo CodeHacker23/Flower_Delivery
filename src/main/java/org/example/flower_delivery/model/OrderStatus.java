@@ -6,7 +6,7 @@ package org.example.flower_delivery.model;
 public enum OrderStatus {
     NEW("Новый"),
     ACCEPTED("Принят курьером"),
-    IN_SHOP("Курьер в магазине"),
+    IN_SHOP("В магазине"),
     PICKED_UP("Забран"),
     ON_WAY("В пути"),
     DELIVERED("Доставлен"),

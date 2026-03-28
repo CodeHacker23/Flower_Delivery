@@ -74,9 +74,11 @@ public class OrderEditHandler {
 
         if (stops.size() > 1) {
             // Мультиадрес: "Какую точку редактировать?"
+            log.info("Магазин зашёл в редактирование мультиадресного заказа: telegramId={}, orderId={}", telegramId, orderId);
             sendChoicePoint(chatId, orderId, stops);
         } else {
             // Одна точка: сразу "Что изменить?"
+            log.info("Магазин зашёл в редактирование заказа: telegramId={}, orderId={}", telegramId, orderId);
             sendChoiceField(chatId, orderId, 1);
         }
     }
@@ -142,6 +144,8 @@ public class OrderEditHandler {
             send(chatId, "❌ Неизвестное поле.");
             return;
         }
+        log.info("Магазин выбрал поле для редактирования: telegramId={}, orderId={}, stop={}, field={}",
+                telegramId, orderId, stopNum, field);
         send(chatId, prompt);
     }
 
@@ -229,9 +233,13 @@ public class OrderEditHandler {
         }
 
         if (ok) {
+            log.info("Магазин успешно обновил поле заказа: telegramId={}, orderId={}, stop={}, field={}, value='{}'",
+                    telegramId, state.getOrderId(), state.getStopNumber(), field, text);
             String label = "address".equals(field) ? "Адрес" : "phone".equals(field) ? "Телефон" : "Комментарий";
             send(chatId, "✅ *" + label + "* обновлён.\n\nНажми «📋 Мои заказы», чтобы увидеть изменения.");
         } else {
+            log.error("Не удалось обновить поле заказа: telegramId={}, orderId={}, stop={}, field={}, value='{}'",
+                    telegramId, state.getOrderId(), state.getStopNumber(), field, text);
             send(chatId, "❌ Не удалось сохранить изменение.");
         }
         return true;
