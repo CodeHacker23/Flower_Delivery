@@ -35,7 +35,7 @@ public class Courier {
     private UUID id;
 
     /**
-     * Пользователь, которому принадлежит этот курьер.
+     * Пользователь, которому принадлежит этот курьер.  git push origin  refaktoring
      *
      * Связь 1:1 с таблицей users:
      * - один user → максимум один courier
