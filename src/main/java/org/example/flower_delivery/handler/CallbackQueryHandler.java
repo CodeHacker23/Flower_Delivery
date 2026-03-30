@@ -793,8 +793,7 @@ public class CallbackQueryHandler {
         }
         boolean updated = orderService.updateOrderStatusByCourier(orderId, courierOpt.get().getUser(), next);
         if (updated) {
-            if (next == OrderStatus.ON_WAY) {
-                orderService.markShopPickupConfirmationRequested(orderId);
+            if (next == OrderStatus.ON_WAY && orderService.markShopPickupConfirmationRequested(orderId)) {
                 orderService.getOrderForShopPickupMessage(orderId)
                         .ifPresent(bot::sendShopPickupConfirmationRequest);
             }
@@ -898,7 +897,7 @@ public class CallbackQueryHandler {
         } catch (TelegramApiException e) {
             log.debug("Редактирование сообщения магазину не выполнено (возможно, устаревшее): orderId={}", orderId, e);
         }
-        answerCallbackQuery(callbackQuery.getId(), confirmed ? "✅ Подтверждено" : "Ответ учтён");
+        answerCallbackQuery(callbackQuery.getId(), "");
     }
 
     private static OrderStatus nextStatusForCourier(OrderStatus current) {

@@ -7,7 +7,7 @@ import org.example.flower_delivery.model.Courier;
 import org.example.flower_delivery.model.Order;
 import org.example.flower_delivery.model.OrderStatus;
 import org.example.flower_delivery.model.OrderStop;
-import org.example.flower_delivery.util.GeoUtil;
+import org.example.flower_delivery.util.RouteUrlBuilder;
 import org.example.flower_delivery.repository.OrderStopRepository;
 import org.example.flower_delivery.service.CourierGeoService;
 import org.example.flower_delivery.service.CourierService;
@@ -16,12 +16,15 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardRemove;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardButton;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardRow;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -119,14 +122,18 @@ public class CourierGeoHandler {
         }
         boolean updated = orderService.updateOrderStatusByCourier(pending.orderId, courierOpt.get().getUser(), OrderStatus.ON_WAY);
         if (updated) {
-            orderService.markShopPickupConfirmationRequested(pending.orderId);
-            orderService.getOrderForShopPickupMessage(pending.orderId)
-                    .ifPresent(bot::sendShopPickupConfirmationRequest);
+            if (orderService.markShopPickupConfirmationRequested(pending.orderId)) {
+                orderService.getOrderForShopPickupMessage(pending.orderId)
+                        .ifPresent(bot::sendShopPickupConfirmationRequest);
+            }
             if (pending.listMessageId != null) {
                 bot.editCourierMyOrdersMessage(chatId, pending.listMessageId, telegramId);
             }
+            sendOnWayRouteMessage(chatId, courierOpt.get(), pending.orderId);
+            sendCourierMenuPlain(chatId, "✅ Счастливого пути. Меню ниже.");
+        } else {
+            sendCourierMenuPlain(chatId, "❌ Не удалось перевести заказ в статус «В пути». Попробуйте ещё раз из «🚚 Мои заказы».");
         }
-        sendCourierMenuPlain(chatId, "✅ Счастливого пути. Меню ниже.");
         return true;
     }
 
@@ -270,6 +277,62 @@ public class CourierGeoHandler {
         return null;
     }
 
+    private void sendOnWayRouteMessage(Long chatId, Courier courier, UUID orderId) {
+        Optional<Order> orderOpt = orderService.getOrderWithShop(orderId);
+        if (orderOpt.isEmpty()) {
+            return;
+        }
+        Order order = orderOpt.get();
+        RouteDestination destination = resolveNextRouteDestination(order);
+        if (destination == null) {
+            return;
+        }
+        BigDecimal fromLat = courier.getLastLatitude() != null ? courier.getLastLatitude() : order.getEffectivePickupLatitude();
+        BigDecimal fromLon = courier.getLastLongitude() != null ? courier.getLastLongitude() : order.getEffectivePickupLongitude();
+        if (fromLat == null || fromLon == null) {
+            return;
+        }
+
+        String yandexUrl = RouteUrlBuilder.buildYandexRouteUrl(
+                fromLat.doubleValue(), fromLon.doubleValue(),
+                destination.latitude().doubleValue(), destination.longitude().doubleValue()
+        );
+        String twoGisUrl = RouteUrlBuilder.build2GisRouteUrl(
+                fromLat.doubleValue(), fromLon.doubleValue(),
+                destination.latitude().doubleValue(), destination.longitude().doubleValue()
+        );
+
+        InlineKeyboardButton yandexButton = InlineKeyboardButton.builder()
+                .text("Яндекс Маршрут")
+                .url(yandexUrl)
+                .build();
+        InlineKeyboardButton twoGisButton = InlineKeyboardButton.builder()
+                .text("2ГИС Маршрут")
+                .url(twoGisUrl)
+                .build();
+        InlineKeyboardMarkup markup = new InlineKeyboardMarkup(List.of(List.of(yandexButton, twoGisButton)));
+
+        String text = "🗺 Маршрут до точки готов.\n\n"
+                + "Адрес: *" + escapeMarkdown(destination.label()) + "*";
+        sendMessageWithInlineButtons(chatId, text, markup);
+    }
+
+    private RouteDestination resolveNextRouteDestination(Order order) {
+        List<OrderStop> stops = orderStopRepository.findByOrderIdOrderByStopNumberAsc(order.getId());
+        for (OrderStop stop : stops) {
+            if (!stop.isDelivered() && stop.hasCoordinates()) {
+                return new RouteDestination(stop.getDeliveryAddress(), stop.getDeliveryLatitude(), stop.getDeliveryLongitude());
+            }
+        }
+        if (order.getDeliveryLatitude() != null && order.getDeliveryLongitude() != null) {
+            return new RouteDestination(order.getDeliveryAddress(), order.getDeliveryLatitude(), order.getDeliveryLongitude());
+        }
+        return null;
+    }
+
+    private record RouteDestination(String label, BigDecimal latitude, BigDecimal longitude) {
+    }
+
     private void sendMessageWithLocationKeyboard(Long chatId, String text) {
         KeyboardButton locationButton = new KeyboardButton("📍 Отправить геолокацию");
         locationButton.setRequestLocation(true);
@@ -311,6 +374,20 @@ public class CourierGeoHandler {
             bot.execute(message);
         } catch (TelegramApiException e) {
             log.error("Ошибка отправки сообщения с кнопкой «В путь»: chatId={}", chatId, e);
+        }
+    }
+
+    private void sendMessageWithInlineButtons(Long chatId, String text, InlineKeyboardMarkup markup) {
+        SendMessage message = SendMessage.builder()
+                .chatId(chatId.toString())
+                .text(text)
+                .parseMode("Markdown")
+                .replyMarkup(markup)
+                .build();
+        try {
+            bot.execute(message);
+        } catch (TelegramApiException e) {
+            log.error("Ошибка отправки сообщения с маршрутными кнопками: chatId={}", chatId, e);
         }
     }
 
@@ -374,5 +451,14 @@ public class CourierGeoHandler {
         } catch (TelegramApiException e) {
             log.error("Ошибка отправки сообщения: chatId={}", chatId, e);
         }
+    }
+
+    private String escapeMarkdown(String value) {
+        if (value == null) {
+            return "Точка доставки";
+        }
+        return value.replace("_", "\\_")
+                .replace("*", "\\*")
+                .replace("[", "\\[");
     }
 }

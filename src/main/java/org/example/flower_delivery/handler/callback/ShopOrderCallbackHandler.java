@@ -162,6 +162,6 @@ public class ShopOrderCallbackHandler {
         }
         String editText = confirmed ? "✅ Подтверждено: вы передали заказ курьеру." : "❌ Вы ответили: Нет — заказ курьеру не передан.";
         ctx.responder().editMessage(ctx.chatId(), ctx.messageId(), editText, null);
-        ctx.responder().answerCallbackQuery(ctx.callbackQueryId(), confirmed ? "✅ Подтверждено" : "Ответ учтён");
+        ctx.responder().answerCallbackQuery(ctx.callbackQueryId(), "");
     }
 }

@@ -234,8 +234,7 @@ public class CourierCallbackHandler {
         }
         boolean updated = orderService.updateOrderStatusByCourier(orderId, courierOpt.get().getUser(), next);
         if (updated) {
-            if (next == OrderStatus.ON_WAY) {
-                orderService.markShopPickupConfirmationRequested(orderId);
+            if (next == OrderStatus.ON_WAY && orderService.markShopPickupConfirmationRequested(orderId)) {
                 orderService.getOrderForShopPickupMessage(orderId).ifPresent(shopNotificationService::sendShopPickupConfirmationRequest);
             }
             ctx.responder().answerCallbackQuery(ctx.callbackQueryId(), "✅ " + next.getDisplayName());

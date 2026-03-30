@@ -259,11 +259,16 @@ public class OrderService {
      * Отметить, что магазину отправлен запрос «Курьер забрал заказ?» (при переходе в «В путь»).
      */
     @Transactional
-    public void markShopPickupConfirmationRequested(UUID orderId) {
-        orderRepository.findById(orderId).ifPresent(order -> {
-            order.setShopPickupConfirmationRequestedAt(LocalDateTime.now());
-            orderRepository.save(order);
-        });
+    public boolean markShopPickupConfirmationRequested(UUID orderId) {
+        Optional<Order> opt = orderRepository.findById(orderId);
+        if (opt.isEmpty()) return false;
+        Order order = opt.get();
+        if (order.getShopPickupConfirmationRequestedAt() != null) {
+            return false;
+        }
+        order.setShopPickupConfirmationRequestedAt(LocalDateTime.now());
+        orderRepository.save(order);
+        return true;
     }
 
     /**
